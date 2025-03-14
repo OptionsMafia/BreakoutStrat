@@ -1,13 +1,8 @@
 ''' 
-redis pipes v3 - after 6th march data was generated
-1. multiple exits fixed (removed exit from strategy and added global exit dictionary)
-2. Exit signal for VEDL generated even though no active trade was going on
+redis pipes v4
 
-Possible issues:
-- Race Condition: The check_for_exits function might be processing a stale copy of active trades that still includes VEDL
-- Duplicate Signal Processing: The signal tracker may not be properly filtering out already processed exit signals
-- State Synchronization: Since this is using Ray for distributed processing, there might be state synchronization issues 
-    between the main process and the SignalTracker actor
+1. Adding cleanup for memory leaks
+
 
 '''
 import redis
@@ -22,6 +17,7 @@ import os
 import json
 import subprocess
 import sys
+# from pympler.tracker import SummaryTracker
 
 
 start = perf_counter()
@@ -78,6 +74,9 @@ def run_tokengen():
     except Exception as e:
         print(f"Error executing tokengen.py: {str(e)}")
         return False
+    finally:
+        if 'indicator_thread' in locals():
+            indicator_thread.join(1.0)
 
 def load_tokens():
     """
@@ -399,6 +398,10 @@ class RedisConnectionManager:
         except Exception as e:
             print(f"Error retrieving batch data from Redis: {str(e)}")
             return {}
+        finally:
+        # Ensure pipeline is explicitly closed
+            if 'pipe' in locals():
+                pipe.reset()
 
     def close(self):
         """Safely close the connection"""
@@ -634,6 +637,7 @@ def pointpos(x):
 
 def strategy(t_df, stockname):
     """Implement the trading strategy"""
+
     entries = []
     # Get state for this symbol
     state = get_symbol_state(stockname)
@@ -1053,10 +1057,13 @@ def main():
 
         batch_interval = 0.5  # Time in seconds between batch processing cycles
 
+        # tracker = SummaryTracker()
+        iteration = 0
         while True:
+            iteration += 1
             current_time = datetime.now().time()
             market_end = datetime.strptime('15:25', '%H:%M').time()
-
+            
             # Check if it's time to end
             if current_time >= market_end:
                 print("\nMarket closing time reached. Generating final report...")
@@ -1092,11 +1099,13 @@ def main():
             print(f"\nChecking for signals at {datetime.now()}")
 
             try:
+                
                 # Get and print active trades using optimized batch method
                 active_trades = ray.get(signal_tracker.get_active_trades.remote())
                 print_active_trades(active_trades, main_conn_manager)
 
                 if active_trades : check_for_exits(active_trades, main_conn_manager, signal_tracker)
+                
 
                 # Process token batches with optimized parallel execution
                 # process_start = time.time()
@@ -1124,6 +1133,10 @@ def main():
                 
                 # process_end = time.time()
                 # print(f"Processed all batches in {process_end - process_start:.2f} seconds")
+                if iteration % 10 == 0:  # Every 10 iterations
+                    import gc
+                    collected = gc.collect()
+                    print(f"Garbage collected {collected} objects")
 
             except Exception as e:
                 print(f"Error in main processing loop: {str(e)}")
@@ -1135,7 +1148,7 @@ def main():
             # Sleep between iterations - we can use a longer interval due to batch processing
             # print(f"Waiting {batch_interval} seconds before next cycle...")
             time.sleep(batch_interval)
-
+        # tracker.print_diff()
     except KeyboardInterrupt:
         print("\nReceived keyboard interrupt. Shutting down gracefully...")
     except Exception as e:
