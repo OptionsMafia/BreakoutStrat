@@ -13,6 +13,12 @@ import sys
 import logging
 import threading
 import ray
+import pytz
+import pyotp
+import requests
+from urllib.parse import parse_qs,urlparse
+import traceback
+import hashlib
 
 # CHANGE MARKET TIME IN IS_MARKET_OPEN() AND EXIT TIME IN STRATEGY()
 # Configure logging
@@ -42,6 +48,41 @@ RESAMPLED_DB = 1  # Database index for resampled data with pivots and EMAs
 RAW_PREFIX = get_date_prefix()
 RESAMPLED_PREFIX = get_date_prefix() + "resampled"
 
+############ FLATTRADE EXECUTION START ################
+
+APIKEY='9d87fcbbb8eb47b6b6d577acf3882266'
+secretKey = '2025.09e4f220bec24ced931170e7ee7ba611c8517eb1705b65ac'
+totp_key='F4A3KMU5W4L6P6IQ2LV6J467S4VQTA7Q'
+password = 'Godmode@6'
+userid = 'FZ11934'
+headerJson =  {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.74 Safari/537.36", "Referer":"https://auth.flattrade.in/"}
+
+
+
+ses = requests.Session()
+sesUrl = 'https://authapi.flattrade.in/auth/session'
+passwordEncrpted =  hashlib.sha256(password.encode()).hexdigest()
+ses = requests.Session()
+
+res_pin = ses.post(sesUrl,headers=headerJson)
+sid = res_pin.text
+url2 = 'https://authapi.flattrade.in/ftauth'
+payload = {"UserName":userid,"Password":passwordEncrpted,"PAN_DOB":pyotp.TOTP(totp_key).now(),"App":"","ClientID":"","Key":"","APIKey":APIKEY,"Sid":sid,
+          "Override":"Y","Source":"AUTHPAGE"}
+res2 = ses.post(url2, json=payload)
+reqcodeRes = res2.json()
+parsed = urlparse(reqcodeRes['RedirectURL'])  
+reqCode = parse_qs(parsed.query)['code'][0]
+api_secret =APIKEY+ reqCode + secretKey 
+api_secret =  hashlib.sha256(api_secret.encode()).hexdigest()
+payload = {"api_key":APIKEY, "request_code":reqCode, "api_secret":api_secret}
+url3 = 'https://authapi.flattrade.in/trade/apitoken'  
+res3 = ses.post(url3, json=payload)
+token = res3.json()['token']
+token
+
+
+############ FLATTRADE EXECUTION END ################
 
 # Replace with these simple global variables:
 total_runs = 0
@@ -51,22 +92,46 @@ active_trades_count = 0
 
 used_pivots = {} 
 
-# Add a simple function to check if stats should be printed
-def should_print_stats():
-    global last_print_time
-    now = datetime.now()
-    if (now - last_print_time).total_seconds() >= 60:  # Print every minute
-        last_print_time = now
-        return True
-    return False
+@ray.remote
+class OrderManager:
+    def __init__(self):
+        """Initialize the API connection once per actor"""
+        from NorenRestApiPy.NorenApi import NorenApi # type: ignore
+        
+        class FlatTradeApiPy(NorenApi):
+            def __init__(self):
+                NorenApi.__init__(self, host='https://piconnect.flattrade.in/PiConnectTP/', 
+                                 websocket='wss://piconnect.flattrade.in/PiConnectWSTp/', 
+                                 eodhost='https://web.flattrade.in/chartApi/getdata/')
+        
+        self.api = FlatTradeApiPy()
+        self.api.set_session(userid=userid, password=password, usertoken=token)
+        self.api.get_limits()
+    
+    def place_order(self, stockname, b_s):
+        """Place an order using the persistent API connection"""
+        temp = stockname
+        val = temp.split("25")[0]
+        stock_name = val+"-EQ"
+        if b_s == 'buy':
+            if "CE" in temp and "PE" not in temp:
+                order_type = "B"
+            else:
+                order_type = "S"
+        elif b_s == 'sell':
+            if "CE" in temp and "PE" not in temp:
+                order_type = "S"
+            else:
+                order_type = "B"
 
-def should_print_active_trades():
-    global last_print_active_trades_time
-    now = datetime.now()
-    if (now - last_print_active_trades_time).total_seconds() >= 59:  # Print every minute
-        last_print_active_trades_time = now
-        return True
-    return False
+        try:
+            ret = self.api.place_order(buy_or_sell=order_type, product_type='I',
+                            exchange='NSE', tradingsymbol=stock_name,
+                            quantity=1, discloseqty=0, price_type='MKT',
+                            retention='DAY', remarks='my_order_003', act_id=userid)
+            return ret
+        except Exception as e:
+            return {"error": str(e)}
 
 class RedisConnectionManager:
     def __init__(self, db=0, pool_size=10):
@@ -680,7 +745,7 @@ def get_next_run_time(interval_seconds=30):
     return next_run, seconds_to_wait
 
 @ray.remote
-def process_token_batch(token_batch, signal_tracker):
+def process_token_batch(token_batch, signal_tracker, order_manager):
     """
     Process a batch of tokens in parallel
     
@@ -748,7 +813,7 @@ def process_token_batch(token_batch, signal_tracker):
                     df = df.sort_values('timestamp')
                 
                 # Apply the strategy 
-                entries = strategy(df, token_name, pivot_info, current_price, signal_tracker)
+                entries = strategy(df, token_name, pivot_info, current_price, signal_tracker, order_manager)
                 
                 # Process entries
                 for entry in entries:
@@ -879,7 +944,7 @@ def check_ema_conditions(df, current_price):
     # If no data is available, return False
     return False
 
-def strategy(df, stockname, pivot_info, current_price, signal_tracker):
+def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_manager):
     """
     Strategy using pre-calculated pivot points
     
@@ -1041,6 +1106,11 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker):
                                 
                                 # Calculate stop loss
                                 stop_loss_price = entry_price * 0.99
+
+                                try:
+                                    ray.get(order_manager.place_order.remote(stockname, 'buy'))
+                                except:
+                                    logger.error("Not able to place order in strategy for ", stockname)
                                 
                                 # Create entry signal
                                 entry = {
@@ -1094,7 +1164,7 @@ def print_active_trades(active_trades, raw_conn, resampled_conn):
     print(f"\n=== ACTIVE TRADES ===")
     print(f"Total Active Trades: {len(active_trades)} at ", datetime.now().time())
     print("-" * 100)
-    print(f"{'Symbol':<20} {'Entry Time':<25} {'Entry Price':>10} {'Current':>10} {'P/L %':>10} {'Stop Loss':>10} {'EMA10':>10}")
+    print(f"{'Symbol':<20} {'Entry Time':<25} {'Entry Price':>10} {'Current':>10} {'P/L %':>10} {'Stop Loss':>10} ")
     print("-" * 100)
     
     # Build a batch query for current prices
@@ -1104,44 +1174,44 @@ def print_active_trades(active_trades, raw_conn, resampled_conn):
     current_prices = raw_conn.get_current_prices_batch(tokens_to_query)
     
     # Get technical data for EMA values from resampled data
-    resampled_data = resampled_conn.get_resampled_data_batch(tokens_to_query)
+    # resampled_data = resampled_conn.get_resampled_data_batch(tokens_to_query)
     
     # Store all EMAs in a dictionary first to prevent scope issues
-    ema_values = {}
+    # ema_values = {}
     
     # Calculate all EMAs first
-    for symbol in active_trades.keys():
-        current_price = current_prices.get(symbol)
-        data = resampled_data.get(symbol, [])
+    # for symbol in active_trades.keys():
+    #     current_price = current_prices.get(symbol)
+    #     data = resampled_data.get(symbol, [])
         
-        if data and current_price:
-            df = pd.DataFrame(data)
-            if not df.empty and 'ema10' in df.columns:
-                if 'timestamp' in df.columns:
-                    df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float)/1000, unit='s')
-                    df = df.sort_values('timestamp')
+    #     if data and current_price:
+    #         df = pd.DataFrame(data)
+    #         if not df.empty and 'ema10' in df.columns:
+    #             if 'timestamp' in df.columns:
+    #                 df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float)/1000, unit='s')
+    #                 df = df.sort_values('timestamp')
                 
-                latest_ema10 = df.iloc[-1]['ema10']
-                live_ema10 = calculate_live_ema(latest_ema10, current_price, 10)
-                ema_values[symbol] = live_ema10
+    #             latest_ema10 = df.iloc[-1]['ema10']
+    #             live_ema10 = calculate_live_ema(latest_ema10, current_price, 10)
+    #             ema_values[symbol] = live_ema10
     
     # Now display rows using pre-calculated EMAs from our dictionary
     for symbol, trade in active_trades.items():
         current_price = current_prices.get(symbol)
         
         # Get the pre-calculated EMA value
-        ema10_value = ema_values.get(symbol, 'N/A')
+        # ema10_value = ema_values.get(symbol, 'N/A')
         
-        if isinstance(ema10_value, (int, float)):
-            ema10_display = f"{ema10_value:.2f}"
-        else:
-            ema10_display = 'N/A'
+        # if isinstance(ema10_value, (int, float)):
+        #     ema10_display = f"{ema10_value:.2f}"
+        # else:
+        #     ema10_display = 'N/A'
         
         if current_price:
             pnl_percentage = ((current_price - trade['entry_price']) / trade['entry_price']) * 100
-            print(f"{symbol:<20} {str(trade['entry_time']):<25} {trade['entry_price']:>10.2f} {current_price:>10.2f} {pnl_percentage:>10.2f} {trade['stop_loss']:>10.2f} {ema10_display:<10}")
+            print(f"{symbol:<20} {str(trade['entry_time']):<25} {trade['entry_price']:>10.2f} {current_price:>10.2f} {pnl_percentage:>10.2f} {trade['stop_loss']:>10.2f} ")
         else:
-            print(f"{symbol:<20} {str(trade['entry_time']):<25} {trade['entry_price']:>10.2f} {'N/A':>10} {'N/A':>10} {trade['stop_loss']:>10.2f} {ema10_display:<10}")
+            print(f"{symbol:<20} {str(trade['entry_time']):<25} {trade['entry_price']:>10.2f} {'N/A':>10} {'N/A':>10} {trade['stop_loss']:>10.2f}")
     print("-" * 100)
 
 def batch_tokens(token_dict, batch_size=25):
@@ -1164,7 +1234,7 @@ def batch_tokens(token_dict, batch_size=25):
         
     return batches
 
-def check_for_exits(active_trades, raw_conn, resampled_conn, signal_tracker):
+def check_for_exits(active_trades, raw_conn, resampled_conn, signal_tracker, order_manager):
     """
     Check if any active trades need to exit based on current prices and technical conditions
     
@@ -1283,6 +1353,11 @@ def check_for_exits(active_trades, raw_conn, resampled_conn, signal_tracker):
                 }
                 
         if exit_data:
+            try:
+                ray.get(order_manager.place_order.remote(symbol, 'sell'))
+            except:
+                logger.error("Not able to place order in strategy for ", symbol)
+            
             # Store the pivot level in the global dictionary
             if 'pivot_level' in trade and trade['pivot_level'] is not None:
                 ray.get(signal_tracker.set_used_pivot.remote(symbol, trade['pivot_level']))
@@ -1326,6 +1401,9 @@ def main():
         
         # Initialize SignalTracker
         signal_tracker = SignalTracker.remote()
+        
+        # Create a single order manager actor
+        order_manager = OrderManager.remote()
         
         # Create connection managers
         raw_conn = RedisConnectionManager(db=RAW_DB, pool_size=20)
@@ -1387,7 +1465,7 @@ def main():
                 
                 # Check for exits on active trades
                 if active_trades:
-                    exits = check_for_exits(active_trades, raw_conn, resampled_conn, signal_tracker)
+                    exits = check_for_exits(active_trades, raw_conn, resampled_conn, signal_tracker, order_manager)
                     if exits > 0:
                         logger.info(f"Exited {exits} positions")
                 
@@ -1396,7 +1474,7 @@ def main():
                 # logger.info(f"Processing {len(token_batches)} batches of tokens...")
                 
                 # Launch all batch processing in parallel
-                futures = [process_token_batch.remote(batch, signal_tracker) for batch in token_batches]
+                futures = [process_token_batch.remote(batch, signal_tracker, order_manager) for batch in token_batches]
                 
                 # Process results as they arrive
                 all_signals = []
@@ -1459,6 +1537,7 @@ def main():
             logger.error(f"Error during cleanup: {str(e)}")
 
 if __name__ == "__main__":
+
     try:
         global token_dict
         # Initialize tokens
