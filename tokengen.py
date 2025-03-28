@@ -203,8 +203,9 @@ def get_fourth_week_thursday():
     current_month = today.month
     current_month_thursday = get_thursday_for_month(current_year, current_month)
 
+
     # Check if today has passed this date
-    if today.date() <= current_month_thursday:
+    if today.date() < (current_month_thursday - timedelta(days=3)):
         # If not passed, return current month's date
         target_date = current_month_thursday
     else:
@@ -323,3 +324,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
