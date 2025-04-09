@@ -1,8 +1,5 @@
 '''
-redis_resampler.py - version 2
-285 - pip.hmget
-303, 304 importing only necessary
-change all the float32 from float64
+redis_resampler with historical data
 '''
 import redis
 import time
@@ -733,6 +730,44 @@ def calculate_ema(prices, period):
     
     return ema
 
+def calculate_ongoing_ema(prices, period, last_ema=None):
+    """
+    Calculate EMA with continuity from last known value
+    
+    Args:
+        prices (numpy array): Array of price values
+        period (int): EMA period
+        last_ema (float): Last known EMA value
+        
+    Returns:
+        numpy array: Array of EMA values
+    """
+    import numpy as np
+    
+    prices = np.array(prices, dtype=np.float32)
+    ema = np.zeros_like(prices)
+    alpha = 2 / (period + 1)
+    
+    if last_ema is not None and last_ema > 0:
+        # Use last known EMA value for first calculation
+        ema[0] = prices[0] * alpha + last_ema * (1 - alpha)
+    else:
+        # Standard initialization if no seed value
+        if len(prices) >= period:
+            ema[period-1] = np.mean(prices[:period])
+        else:
+            # Not enough data
+            return np.full_like(prices, np.nan)
+    
+    # Calculate remaining EMAs
+    for i in range(1 if last_ema else period, len(prices)):
+        ema[i] = prices[i] * alpha + ema[i-1] * (1 - alpha)
+    
+    # Set values before period to NaN if no seed
+    if not last_ema and period > 1:
+        ema[:period-1] = np.nan
+    
+    return ema
 
 def prepare_new_data(data, token_name, token_value, resampled_client):
     """
@@ -836,9 +871,32 @@ def prepare_new_data(data, token_name, token_value, resampled_client):
         # span10 = 2 / (10 + 1)
         # span20 = 2 / (20 + 1)
         # resampled_df['ema10'] = resampled_df['close'].ewm(alpha=span10, adjust=False).mean()
-        # resampled_df['ema20'] = resampled_df['close'].ewm(alpha=span20, adjust=False).mean()        
-        resampled_df['ema10'] = calculate_ema(resampled_df['close'].values, 10)
-        resampled_df['ema20'] = calculate_ema(resampled_df['close'].values, 20)
+        # resampled_df['ema20'] = resampled_df['close'].ewm(alpha=span20, adjust=False).mean()  
+        #       
+        # resampled_df['ema10'] = calculate_ema(resampled_df['close'].values, 10)
+        # resampled_df['ema20'] = calculate_ema(resampled_df['close'].values, 20)
+
+        # Get last EMA values
+        last_emas = None
+        last_record = resampled_client.zrange(f"{RESAMPLED_PREFIX}:{token_value}:index", -1, -1)
+        if last_record:
+            data = resampled_client.hgetall(last_record[0])
+            if 'ema10' in data and 'ema20' in data:
+                try:
+                    last_ema10 = float(data['ema10'])
+                    last_ema20 = float(data['ema20'])
+                    last_emas = (last_ema10, last_ema20)
+                except:
+                    pass
+
+        # Then calculate EMAs with continuity
+        close_values = resampled_df['close'].values
+        if last_emas:
+            resampled_df['ema10'] = calculate_ongoing_ema(close_values, 10, last_emas[0])
+            resampled_df['ema20'] = calculate_ongoing_ema(close_values, 20, last_emas[1])
+        else:
+            resampled_df['ema10'] = calculate_ongoing_ema(close_values, 10)
+            resampled_df['ema20'] = calculate_ongoing_ema(close_values, 20)
 
         return resampled_df
    
@@ -941,7 +999,7 @@ def process_token_batch(token_batch, last_run_time=None):
             resampled_client.close()
         except:
             pass
-            
+                  
         return results
     
     except Exception as e:
@@ -1307,8 +1365,8 @@ def run_resampler():
         return
     
     # Load tokens
-    # tokens = load_tokens()
-    tokens = {"APOLLOTYRE25APR430CE": "66866"}
+    tokens = load_tokens()
+    # tokens = {"APOLLOTYRE25APR430CE": "66866"}
     if not tokens:
         logger.error("No tokens loaded. Exiting.")
         return
@@ -1578,15 +1636,15 @@ if __name__ == "__main__":
     SOURCE_PREFIX = get_date_prefix()
     RESAMPLED_PREFIX = get_date_prefix() + "resampled"
 
-    # tokens = {"APOLLOTYRE25APR430CE": "66866"}
+    tokens = {"ASTRAL25APR1300PE": "67719"}
     # # # # tokens = load_tokens()
     
-    # if tokens:
-    #     # Print data for the first token
-    #     for token_name, token_value in tokens.items():
-    #         print_token_data(token_name, token_value)
+    if tokens:
+        # Print data for the first token
+        for token_name, token_value in tokens.items():
+            print_token_data(token_name, token_value)
 
-    # time.sleep(1000)
+    time.sleep(1000)
 
     # tokens = load_tokens()
     # for token_name in tokens.keys():
