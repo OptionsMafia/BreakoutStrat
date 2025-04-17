@@ -1498,7 +1498,7 @@ def run_resampler():
             logger.info(f"Next resampling run scheduled at {next_run} ({wait_seconds:.0f} seconds from now)")
             
             # Wait until next run time
-            # time.sleep(wait_seconds)
+            time.sleep(wait_seconds)
             
             run_start = time.time()
             now = datetime.now()
@@ -1547,7 +1547,7 @@ def run_resampler():
             
             # Update last run time to the start of this run
             last_run_time = run_start
-            time.sleep(1000)
+            # time.sleep(1000)
             gc.collect()
             
     except KeyboardInterrupt:
