@@ -1,5 +1,6 @@
 '''
 pivot sliding window
+Added flattrade configs to fetch historical data instead of using angelone API
 '''
 import redis
 import time
