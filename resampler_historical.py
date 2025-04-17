@@ -1,5 +1,5 @@
 '''
-redis_resampler with historical data
+pivot sliding window
 '''
 import redis
 import time
@@ -11,10 +11,10 @@ import json
 import logging
 import threading
 import ray
-import config
+import flattrade_config
 
-#################pivot is not being calculated correctly******************
-
+# Get authenticated API and token
+api, token = flattrade_config.get_flattrade_api()
 
 # Configure logging
 logging.basicConfig(
@@ -80,6 +80,7 @@ def load_tokens():
     except Exception as e:
         logger.error(f"Error loading token dictionary: {str(e)}")
         return {}
+
 
 # Create a Redis connection manager for better connection handling
 class RedisConnection:
@@ -206,7 +207,7 @@ def prepare_dataframe(data):
     df = df.reset_index().rename(columns={'index': 'timestamp', 'datetime': 'timestamp'})
     
     # Calculate pivot points
-    df['pivot'] = [pivotid(i, df, 3, 3) for i in range(len(df))]
+    df['pivot'] = optimize_pivot_calculations(df)
     df['pointpos'] = df.apply(lambda row: pointpos(row), axis=1)
     
     # Calculate EMAs
@@ -218,6 +219,49 @@ def prepare_dataframe(data):
     df['ema20'] = calculate_ema(df['close'].values, 20)
     
     return df
+
+def optimize_pivot_calculations(df):
+    """
+    Efficiently calculate pivot points using a sliding window approach.
+    Returns a numpy array of pivot values (0, 1, or 2) for each row.
+    """
+    n_rows = len(df)
+    lookback = 3  # Number of candles to look back
+    lookforward = 3  # Number of candles to look forward
+    
+    # Pre-allocate the results array
+    pivot_values = np.zeros(n_rows, dtype=np.int8)
+    
+    # Extract high and low values as numpy arrays for fast comparison
+    highs = df['high'].values
+    lows = df['low'].values
+    
+    # We can only calculate pivots for rows that have enough data before and after
+    for i in range(lookback, n_rows - lookforward):
+        # Check if current high is greater than all highs in the window
+        current_high = highs[i]
+        is_pivot_high = True
+        
+        # Check previous candles
+        for j in range(i - lookback, i):
+            if current_high <= highs[j]:
+                is_pivot_high = False
+                break
+                
+        # If still potentially a pivot high, check forward candles
+        if is_pivot_high:
+            for j in range(i + 1, i + lookforward + 1):
+                if current_high <= highs[j]:
+                    is_pivot_high = False
+                    break
+        
+        # If it's a pivot high, mark it as 2 in our results
+        if is_pivot_high:
+            pivot_values[i] = 2
+            
+        # Similar logic for pivot lows can be added here if needed
+    
+    return pivot_values
 
 def get_lot_sizes_from_json(token_dict):
     """
@@ -323,13 +367,14 @@ def update_historical_pivot_values(token_name, token_value, resampled_client):
     # Prepare pipeline for updates
     update_pipe = resampled_client.pipeline(transaction=False)
     pivot_updates = 0
+    pivot_values = optimize_pivot_calculations(df)
     
     # Recalculate pivot values for all applicable candles
     for i in range(len(df)):
         if i < 3 or i >= len(df) - 3:
             continue  # Skip candles at edges that don't have enough neighbors
             
-        pivot_value = pivotid(i, df, 3, 3)
+        pivot_value = pivot_values[i]
         row = df.iloc[i]
         ts_ms = row['timestamp_ms']
         redis_key = timestamp_to_key.get(ts_ms)
@@ -367,7 +412,7 @@ def update_historical_pivot_values(token_name, token_value, resampled_client):
     if pivot_updates > 0:
         update_pipe.execute()
 
-def load_historical_data(token_dict, days_back=30):
+def load_historical_data(token_dict, days_back=10):
     """
     Fetches historical data for tokens and adds them to the resampled database
     
@@ -375,85 +420,98 @@ def load_historical_data(token_dict, days_back=30):
         token_dict (dict): Dictionary of token_name: token_value pairs
         days_back (int): Number of days to look back for historical data
     """
-    from_date = (datetime.now() - timedelta(days=days_back)).replace(hour=9, minute=0, second=0).strftime("%Y-%m-%d %H:%M")
-    to_date = (datetime.now() - timedelta(days=1)).replace(hour=15, minute=30, second=0).strftime("%Y-%m-%d %H:%M")
-    interval = "FIVE_MINUTE"
+    logger.info(f"Loading historical data for {len(token_dict)} tokens")
+  
+    api.get_limits()
+
+    
+    # Get lot sizes for volume calculation
     lot_sizes = get_lot_sizes_from_json(token_dict)
     
-    logger.info(f"Loading historical data for {len(token_dict)} tokens from {from_date} to {to_date}")
+    # Find the last business day with data
+    BusDay = 1
+    feed_json = {}
     
-    # Import SmartAPI functions if not already imported
-    from SmartApi import SmartConnect
-    import pyotp
-    
-    # Initialize SmartAPI
-    api_key = config.API_KEY
-    client_id = config.USERNAME
-    password = config.PIN
-    totp = pyotp.TOTP(config.TOKEN).now()
+    # Keep going back until we find a day with sufficient data
+    while True:
+        lastBusDay = datetime.today()-timedelta(days=BusDay)
+        start_lastBusDay = lastBusDay.replace(hour=9, minute=15, second=0, microsecond=0)
+        end_lastBusDay = lastBusDay.replace(hour=15, minute=30, second=0, microsecond=0)
 
-    try:
-        # Create a SmartConnect object
-        smart_api = SmartConnect(api_key)
-        # Login
-        data = smart_api.generateSession(client_id, password, totp)
-    except Exception as e:
-        logger.error(str(e))        
+        # Try to get data for a reference token to check if the day has data
 
-    import datafetcher as hdata
-    
-    # Process tokens in batches
-    batch_size = 20  # Process 20 tokens at a time
-    for i in range(0, len(token_dict), batch_size):
-        batch = dict(list(token_dict.items())[i:i+batch_size])
-        logger.info(f"Processing historical data batch {i//batch_size + 1}/{(len(token_dict)-1)//batch_size + 1}")
+        try:            
+            ret = api.get_time_price_series(exchange='NSE', token="26000", 
+                                            starttime=start_lastBusDay.timestamp(),endtime = end_lastBusDay.timestamp(), 
+                                            interval="5")
+            df = pd.DataFrame(ret)
+            df = df[::-1]
+
+            if len(df) > 10:
+                break
+
+        except Exception as e:
+            logger.warning(f"Error checking business day: {str(e)}")
         
-        # Use get_historical_data_with_rate_limit from the original script
-        historical_data = hdata.get_historical_data_with_rate_limit(list(batch.values()), from_date, to_date, interval)
-        
-        if historical_data:
-            # Process each token
-            with RedisConnection(db=RESAMPLED_DB) as resampled_client:
-                for token_name, token_value in batch.items():
-                    lot_size = lot_sizes.get(token_value, 550)
-                    if token_value in historical_data:
-                        data = historical_data[token_value]
-                        
-                        # Process the data to match the format expected by prepare_dataframe
-                        data_list = []
-                        for _, row in data.iterrows():
-                            entry = {
-                                'open': row['open'],
-                                'high': row['high'],
-                                'low': row['low'],
-                                'close': row['close'],
-                                'volume': row['volume'],
-                                'timestamp': int(row.name.timestamp() * 1000)  # Convert to milliseconds
-                            }
-                            data_list.append(entry)
-                        
-                        # Prepare and resample data
-                        resampled_df = prepare_dataframe(data_list)
-                        # In load_historical_data function, add these print statements:
-                                                
-                        if not resampled_df.empty:
-                            # Fix the adjVol calculation
-                            # Instead of using diff, calculate it directly from volume
-                            if 'volume' in data.columns:
-                                # Sort by timestamp to ensure correct conversion
-                                data = data.sort_index()
-                                resampled_df['adjVol'] = data['volume'].resample('5Min').sum()
-                            
-                            # Store the resampled data
-                            stored_count = store_historical_resampled_data(resampled_df, token_name, token_value, 
-                                                                           resampled_client, lot_size)
-                            logger.info(f"Loaded historical data for {token_name}: {stored_count} candles")
-                            
-                            # Update pivot values
-                            update_historical_pivot_values(token_name, token_value, resampled_client)
+        BusDay = BusDay + 1
+        if BusDay > days_back:  # Avoid infinite loop
+            logger.error(f"Could not find a valid business day within {days_back} days")
+            return
+
+    for token_name,token_value in token_dict.items():
+        try:
+            ret = api.get_time_price_series(exchange='NFO', token=token_value,
+                                            starttime=start_lastBusDay.timestamp(),
+                                            endtime = end_lastBusDay.timestamp(), interval="5")
+            df = pd.DataFrame(ret)
+            df = df[::-1]
+            if len(df) > 1:
+                feed_json[token_name] = df
+                logger.info(f"Fetched {len(df)} candles for {token_name}")
+            else:
+                logger.warning(f"Insufficient data for {token_name}: only {len(df)} candles found")
+        except Exception as e:
+            logger.error(f"Error fetching data for {token_name}: {str(e)}")
     
-    # Logout when done
-    smart_api.terminateSession(client_id)
+    # Process the fetched data
+    with RedisConnection(db=RESAMPLED_DB) as resampled_client:
+        for token_name, df in feed_json.items():
+            token_value = token_dict[token_name]
+            lot_size = lot_sizes.get(token_value, 550)  # Default lot size if not found
+            
+            try:
+                # Convert DataFrame to format expected by prepare_dataframe
+                data_list = []
+                for _, row in df.iterrows():
+                    entry = {
+                        'open': row.get('into', 0),
+                        'high': row.get('inth', 0),
+                        'low': row.get('intl', 0),
+                        'close': row.get('intc', 0),
+                        'volume': row.get('intv', 0),
+                        'timestamp': int(float(row.get('ssboe')) * 1000)  # Convert to milliseconds
+                    }
+                    data_list.append(entry)
+                
+                # Prepare and resample data
+                resampled_df = prepare_dataframe(data_list)
+                
+                
+                if not resampled_df.empty:
+                    # Store the resampled data
+                    stored_count = store_historical_resampled_data(resampled_df, token_name, token_value, 
+                                                                  resampled_client, lot_size)
+                    logger.info(f"Loaded historical data for {token_name}: {stored_count} candles")
+                    
+                    # Update pivot values
+                    update_historical_pivot_values(token_name, token_value, resampled_client)
+                else:
+                    logger.warning(f"No data after resampling for {token_name}")
+            
+            except Exception as e:
+                logger.error(f"Error processing data for {token_name}: {str(e)}")
+    
+    logger.info(f"Completed loading historical data for {len(feed_json)} tokens")
 
 @ray.remote
 def get_data_batch(tokens, source_db=0, since_timestamp=None):
@@ -652,13 +710,14 @@ def update_pivot_values(token_name, token_value, resampled_client):
     # Prepare pipeline for updates
     update_pipe = resampled_client.pipeline(transaction=False)
     pivot_updates = 0
+    pivot_values = optimize_pivot_calculations(df)
     
     # Recalculate pivot values for all applicable candles
     for i in range(len(df)):
         if i < 3 or i >= len(df) - 3:
             continue  # Skip candles at edges that don't have enough neighbors
             
-        pivot_value = pivotid(i, df, 3, 3)
+        pivot_value = pivot_values[i]
         row = df.iloc[i]
         ts_ms = row['timestamp_ms']
         redis_key = timestamp_to_key.get(ts_ms)
@@ -864,7 +923,8 @@ def prepare_new_data(data, token_name, token_value, resampled_client):
             resampled_df = resampled_df.iloc[new_intervals]
        
         # Calculate pivot points
-        resampled_df['pivot'] = [pivotid(i, resampled_df, 3, 3) for i in range(len(resampled_df))]
+        # resampled_df['pivot'] = [pivotid(i, resampled_df, 3, 3) for i in range(len(resampled_df))]
+        resampled_df['pivot'] = optimize_pivot_calculations(resampled_df)
         resampled_df['pointpos'] = resampled_df.apply(lambda row: pointpos(row), axis=1)
        
         # Calculate EMAs
@@ -999,7 +1059,8 @@ def process_token_batch(token_batch, last_run_time=None):
             resampled_client.close()
         except:
             pass
-                  
+        
+        del raw_data            
         return results
     
     except Exception as e:
@@ -1134,6 +1195,8 @@ def store_historical_resampled_data(resampled_data, token_name, token_value, res
     
     return stored_count
 
+_FIRST_RUN_COMPLETED = False
+
 def store_resampled_data(resampled_data, token_name, token_value, resampled_client):
     """
     Store or update resampled dataframe in Redis
@@ -1147,11 +1210,13 @@ def store_resampled_data(resampled_data, token_name, token_value, resampled_clie
     Returns:
         int: Number of entries stored/updated
     """
+
     if resampled_data.empty:
         return 0
     
     prefix = RESAMPLED_PREFIX
     stored_count = 0
+    global _FIRST_RUN_COMPLETED
     
     # Create a pipeline for bulk operations
     pipe = resampled_client.pipeline(transaction=False)
@@ -1164,6 +1229,13 @@ def store_resampled_data(resampled_data, token_name, token_value, resampled_clie
         # Get timestamp and format it
         timestamp = int(row['timestamp'].timestamp() * 1000)  # Convert to milliseconds
         # print(f"DEBUG: Storing row with timestamp={timestamp}, adjVol={row['adjVol']}")
+
+        candle_time = row['timestamp'].time()
+        # if (candle_time.hour == 9 and candle_time.minute == 5) or (candle_time.hour == 9 and candle_time.minute == 10):
+        #     continue
+        # To skip the time before 9;15
+        if not _FIRST_RUN_COMPLETED and candle_time.hour == 9 and candle_time.minute in (5, 10):
+            continue
         
         # Create hash key for this data point
         data_key = f"{prefix}:{token_value}:{timestamp}"
@@ -1206,6 +1278,9 @@ def store_resampled_data(resampled_data, token_name, token_value, resampled_clie
         
         stored_count += 1
     
+    # Mark first run as completed
+    _FIRST_RUN_COMPLETED = True
+
     # Execute pipeline
     pipe.execute()
     
@@ -1310,7 +1385,7 @@ def is_market_open():
 
     # Check market hours (9:00 to 15:30)
     current_time = now.time()
-    market_start = datetime.strptime('09:00', '%H:%M').time()
+    market_start = datetime.strptime('09:15', '%H:%M').time()
     market_end = datetime.strptime('15:30', '%H:%M').time()
 
     return market_start <= current_time <= market_end
@@ -1347,6 +1422,7 @@ def start_periodic_summary():
     reporter_thread.start()
     return reporter_thread
 
+import gc
 def run_resampler():
     """
     Main function to run the resampling process using Ray for parallel processing
@@ -1366,25 +1442,30 @@ def run_resampler():
     
     # Load tokens
     tokens = load_tokens()
-    # tokens = {"APOLLOTYRE25APR430CE": "66866"}
+    # tokens = {"ADANIGREEN25APR900PE": "64625"}
     if not tokens:
         logger.error("No tokens loaded. Exiting.")
         return
     
-    logger.info(f"Loaded {len(tokens)} tokens")
+    now = datetime.now()
 
-    try:
-        with RedisConnection(db=RESAMPLED_DB) as resampled_client:
-            # Check if there are any keys matching the resampled data pattern
-            index_keys = resampled_client.keys(f"{RESAMPLED_PREFIX}:*:index")
-            
-            # If no index keys exist, the database is empty
-            if len(index_keys) == 0:
-                logger.info("Loading historical data before starting incremental updates")
-                load_historical_data(tokens, days_back=10) 
+    # Skip processing if market is closed
+    if not (9 <= now.hour and now.minute <= 10):   
+        try:
+            with RedisConnection(db=RESAMPLED_DB) as resampled_client:
+                # Check if there are any keys matching the resampled data pattern
+                index_keys = resampled_client.keys(f"{RESAMPLED_PREFIX}:*:index")
+                
+                # If no index keys exist, the database is empty
+                if len(index_keys) == 0:
+                    logger.info("Loading historical data before starting incremental updates")
+                    load_historical_data(tokens, days_back=10) 
 
-    except Exception as e:
-        logger.error(f"Error: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")   
+    else:
+        logger.info("Market is closed. Bye")      
+ 
             
     # Initialize last_run_time to current time minus 5 minutes to get recent data on first run
     last_run_time = time.time() - 43200    # 12 hr ago
@@ -1394,31 +1475,37 @@ def run_resampler():
     logger.info("Starting Live Data Resampling")
     
     try:
-        while True:
+        market_open_time = datetime.strptime('09:15', '%H:%M').time()
+
+        while True:    
+            now = datetime.now()   
+            current_time = now.time()       
+            if current_time >= market_open_time:
+                break
+            
+
+        while True:                        
+
+            # Skip processing if market is closed
+            # if not is_market_open() or not (9 <= now.hour <= 15 and now.minute > 30):
+            #     logger.info("Market is closed. Bye")
+            #     break
+
             # Calculate next run time (aligned to 5-minute intervals)
             next_run, wait_seconds = get_next_run_time(5)
 
-            if next_run.hour == 15 and next_run.minute > 30 and next_run.second > 0:
-                logger.info(f"Market END. Good bye")
-                break
-            
             logger.info(f"Next resampling run scheduled at {next_run} ({wait_seconds:.0f} seconds from now)")
             
             # Wait until next run time
-            time.sleep(wait_seconds)
+            # time.sleep(wait_seconds)
             
             run_start = time.time()
             now = datetime.now()
-            
+  
             logger.info(f"\nStarting incremental resampling run at {now}")
-            
-            # Skip processing if market is closed
-            if not is_market_open() and not (9 <= now.hour <= 18):
-                logger.info("Market is closed. Skipping this run.")
-                continue
-            
+
             # Process tokens in batches
-            token_batches = batch_tokens(tokens, batch_size=20)
+            token_batches = batch_tokens(tokens, batch_size=50)
             logger.info(f"Processing {len(token_batches)} batches of tokens in parallel - Using data since {datetime.fromtimestamp(last_run_time)}")
             
             # Submit all batch processing tasks to Ray with the last run time
@@ -1459,6 +1546,8 @@ def run_resampler():
             
             # Update last run time to the start of this run
             last_run_time = run_start
+            time.sleep(1000)
+            gc.collect()
             
     except KeyboardInterrupt:
         logger.info("Resampler stopped by user")
@@ -1636,33 +1725,19 @@ if __name__ == "__main__":
     SOURCE_PREFIX = get_date_prefix()
     RESAMPLED_PREFIX = get_date_prefix() + "resampled"
 
-    tokens = {"ASTRAL25APR1300PE": "67719"}
-    # # # # tokens = load_tokens()
+    # tokens = {"ADANIGREEN25APR900PE": "64625"}
+    # # tokens = load_tokens() 
     
-    if tokens:
-        # Print data for the first token
-        for token_name, token_value in tokens.items():
-            print_token_data(token_name, token_value)
+    # if tokens:
+    #     # Print data for the first token
+    #     for token_name, token_value in tokens.items():
+    #         print_token_data(token_name, token_value)
 
-    time.sleep(1000)
+    # time.sleep(1000)
 
-    # tokens = load_tokens()
-    # for token_name in tokens.keys():
-    #     pivot_data = get_latest_pivot_index(token_name)
-    #     if pivot_data:
-    #         print(f"Latest pivot for {token_name}:")
-    #         print(f"  Pivot Index: {pivot_data['pivot_index']}")
-    #         print(f"  Timestamp: {pivot_data['timestamp']}")
-    #         print(f"  Last Updated: {pivot_data['last_updated']}")
-    #     else:
-    #         print(f"No pivot data available for {token_name}")
-    
     parser = argparse.ArgumentParser(description='Redis Ticker Data Resampler with Ray')
     parser.add_argument('--debug', action='store_true', help='Run in debug mode (process single token)')
     args = parser.parse_args()
-    
-    # Start summary reporter in background
-    summary_thread = start_periodic_summary()
     
     if args.debug:
         # Initialize Ray
@@ -1671,7 +1746,6 @@ if __name__ == "__main__":
             
         # Process a single token for debugging
         tokens = load_tokens()
-        # tokens = {"BAJAJ-AUTO25MAR8000CE": "80094"}
         if tokens:
             sample_token = dict([next(iter(tokens.items()))])
             logger.info(f"Debug mode: Processing sample token {list(sample_token.keys())[0]}")
