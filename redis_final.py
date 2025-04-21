@@ -1,5 +1,5 @@
 '''
-trading_system.py - Optimized trading system using pre-calculated resampled data
+trading_system.py - Changed the risk to 20Rs
 
 '''
 import redis
@@ -112,6 +112,41 @@ class OrderManager:
         self.budget = 5000
         # Leverage factor for MIS orders
         self.leverage_factor = 4.543
+        self.max_risk = 20
+
+    def calculate_quantity(self, entry_price, stockname):
+        """
+        Calculate the optimal quantity based on fixed risk and 1% stop loss
+        while keeping budget under limit
+        
+        Args:
+            entry_price (float): Entry price of the stock
+            
+        Returns:
+            int: Number of shares to buy
+        """
+        # Calculate stop loss (1% below entry price)
+        stop_loss = entry_price*0.99
+        
+        # Calculate price difference for stop loss
+        price_diff = entry_price - stop_loss
+        
+        # Calculate quantity based on max risk and stop loss
+        risk_based_quantity = int(self.max_risk / price_diff)
+        
+        # Calculate budget-based quantity
+        budget_based_quantity = int(self.budget / entry_price)
+        
+        # Use the smaller of the two quantities
+        quantity = min(risk_based_quantity, budget_based_quantity)
+
+        if quantity < 1:
+            return 0
+        
+        # Ensure minimum quantity of 1
+        quantity = max(1, quantity)
+        
+        return quantity
     
     def place_order(self, stockname, b_s, quantity=None):        
         """Place an order using the persistent API connection"""
@@ -143,16 +178,20 @@ class OrderManager:
                         return {"low_mis": "MIS price too low", "mis_price": mis_price}                            
                     
                     # Calculate quantity based on budget and MIS price
-                    quantity = int(self.budget / mis_price)  # Round down to integer
-                    
-                    # Ensure minimum quantity of 1
-                    quantity = max(1, quantity)                                       
+                    quantity = self.calculate_quantity(mis_price, stockname)                                      
                 
                 # Place the order with calculated quantity
                 ret = self.api.place_order(buy_or_sell=order_type, product_type='I',
                                 exchange='NSE', tradingsymbol=stock_name,
                                 quantity=quantity, discloseqty=0, price_type='MKT',
                                 retention='DAY', remarks='mis_equity_order', act_id=userid)
+                
+                if ret is None:
+                    logger.warning(f"No valid quote for {stockname}, reinitializing API and retrying")
+                    success = self.OrderManager()
+                    if not success:
+                        logger.error("Failed to reinitialize API, rerun the script")                        
+                        return None
 
                 # Return both the API response and the calculated values
                 return {
@@ -191,7 +230,7 @@ class RedisConnectionManager:
             self.client = redis.Redis(connection_pool=self.pool)
         return self.client
 
-    def get_resampled_data_batch(self, tokens, max_records=250):
+    def get_resampled_data_batch(self, tokens, max_records=200):
         """
         Get resampled data for multiple tokens at once using Redis pipeline
         
@@ -299,8 +338,7 @@ class RedisConnectionManager:
                     # Process data
                     if data:
                         # Convert numeric strings to floats
-                        for numeric_field in ['ltp', 'open', 'high', 'low', 'close', 'adjVol', 'ema10', 'ema20',
-                                              'ema50', 'pivot']:
+                        for numeric_field in ['ltp', 'open', 'high', 'low', 'close', 'adjVol', 'ema10', 'ema20', 'pivot']:
                             if numeric_field in data:
                                 try:
                                     data[numeric_field] = float(data[numeric_field])
@@ -940,14 +978,12 @@ def get_live_ema_values(df, current_price):
         latest_row = df.iloc[-1]
         latest_ema10 = latest_row.get('ema10')
         latest_ema20 = latest_row.get('ema20')
-        latest_ema50 = latest_row.get('ema50')
         
         # Calculate live EMA values
         live_ema10 = calculate_live_ema(latest_ema10, current_price, 10) if latest_ema10 is not None else None
         live_ema20 = calculate_live_ema(latest_ema20, current_price, 20) if latest_ema20 is not None else None
-        live_ema50 = calculate_live_ema(latest_ema50, current_price, 50) if latest_ema50 is not None else None
 
-        return live_ema10, live_ema20, live_ema50
+        return live_ema10, live_ema20
     
     return None, None
 
@@ -963,17 +999,17 @@ def check_ema_conditions(df, current_price):
         bool: True if live EMA10 > live EMA20, False otherwise
     """
     # Calculate live EMAs
-    live_ema10, live_ema20, live_ema50 = get_live_ema_values(df, current_price)
+    live_ema10, live_ema20 = get_live_ema_values(df, current_price)
  
     # Check EMA condition
     if live_ema10 is not None and live_ema20 is not None:
-        return live_ema10 > live_ema20 > live_ema50
+        return live_ema10 > live_ema20
     
     # If we can't calculate live EMAs, fall back to the latest values from the dataframe
     if len(df) > 0:
         latest_row = df.iloc[-1]
         if 'ema10' in latest_row and 'ema20' in latest_row:
-            return latest_row['ema10'] > latest_row['ema20'] > latest_row['ema50']
+            return latest_row['ema10'] > latest_row['ema20']
     
     # If no data is available, return False
     return False
@@ -1046,6 +1082,20 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
     if len(df) == 0:
         return []
     
+    # import pandas as pd
+    # pd.set_option('display.max_rows', None)
+    # pd.set_option('display.max_columns', None)
+    # pd.set_option('display.width', None)
+    # pd.set_option('display.max_colwidth', None)
+    
+    # # Print the complete dataframe
+    # print("\nComplete DataFrame:")
+    # print(stockname)
+    # print(df)
+    # print(pivot_info)
+    # time.sleep(1000)
+      
+    
     entries = []
     current_time = datetime.now().time()
     start_time = datetime.strptime('09:15', '%H:%M').time()
@@ -1059,33 +1109,16 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
     if current_time >= exit_time:
         return []
     
+    if len(df) < 15:
+        return []
+    
     # Check if we need to sort the dataframe by timestamp
     if 'timestamp' in df.columns and not df['timestamp'].is_monotonic_increasing:
         try:
             df = df.sort_values('timestamp')
         except Exception:
             pass
-
-  
-    # import pandas as pd
-    # pd.set_option('display.max_rows', None)
-    # pd.set_option('display.max_columns', None)
-    # pd.set_option('display.width', None)
-    # pd.set_option('display.max_colwidth', None)
-    
-    # # Print the complete dataframe
-    # print("\nComplete DataFrame:")
-    # print(stockname)
-    # print(df)
-    # print(pivot_info)
-    # time.sleep(1000)
-    
-    # # # Reset display options to default
-    # pd.reset_option('display.max_rows')
-    # pd.reset_option('display.max_columns')
-    # pd.reset_option('display.width')
-    # pd.reset_option('display.max_colwidth')
-
+ 
     # Extract pivot level from pivot_info and validate against the dataframe
     if pivot_info and 'pivot_index' in pivot_info:
         pivot_index = pivot_info['pivot_index']
@@ -1094,11 +1127,12 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
         pivot_candles = df[df['pivot'] == 2]
 
         # Calculate ADR value
-        adr_value, ot, nt = calculate_adr(df)
+        adr_value, ot, nt = calculate_adr(df)              
         
         # Skip if ADR value couldn't be calculated or is greater than 70%
         if adr_value is None or adr_value <= 5:
-            return []            
+            return []     
+               
         
         # Try to find the correct pivot candle
         if len(pivot_candles) > 0:
@@ -1145,8 +1179,8 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
                 return []
 
             # Check if current price has broken above the pivot level
-            if current_price > pivot_level and check_ema_conditions(df, current_price) and current_price > live_ema10:
-
+            if current_price > pivot_level and check_ema_conditions(df, current_price): #and current_price > live_ema10:                               
+                
                 # Calculate movement percentage (10-candle lookback)
                 if len(df) >= 12:
                     # Sort to ensure we're using the right order
@@ -1174,9 +1208,9 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
                             except:
                                 # print("volume: 0 division error for ", stockname)
                                 return []
-                    
+                            
                         # Apply movement and volume filters
-                        if  recent_volume > 1000000:
+                        if  recent_volume > 1000000:                                   
                             
                             # Determine entry price
                             entry_price = current_price
@@ -1188,40 +1222,41 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
                                 
                                 # Calculate stop loss
                                 stop_loss_price = entry_price * 0.99
-
-                                try:
-                                    # order_response = ray.get(order_manager.place_order.remote(stockname, 'buy'))
-                                    # order_response = None
-                                    
-                                    # if "error" in order_response:
-                                    #     logger.error(f"Not able to place order for {stockname}: {order_response['error']}")
-                                        
-                                    
-                                    # else:                                
-                                        # Create entry signal
-                                    entry = {
-                                        'entry_time': datetime.now(),
-                                        'entry_price': entry_price,
-                                        'stop_loss': stop_loss_price,
-                                        'pivot_level': pivot_level,
-                                        'ema10': df_sorted.iloc[-1]['ema10'] if 'ema10' in df_sorted.columns else None,
-                                        'entry_type': 'Breakout',
-                                        'entry_reason': f'Breakout above pivot {pivot_level:.2f} with {movement_percentage:.2f}% movement',
-                                        'movement_percentage': movement_percentage,
-                                        'sl_adjusted': False,
-                                        # 'quantity' : order_response['quantity'],
-                                        'symbol': stockname
-                                    }
-                                    
-                                    entries.append(entry)
                                 
-                                    # Update state
-                                    state['in_trade'] = True
-                                    state['stop_loss_price'] = stop_loss_price
-                                    ray.get(signal_tracker.set_used_pivot.remote(stockname, pivot_level)) 
-                                    print("ADR: ", adr_value, "15th candle: ", 
-                                            "15th candle: ",ot,
-                                            "1st candle: ",nt)  
+                                try:
+                                    order_response = ray.get(order_manager.place_order.remote(stockname, 'buy'))  
+                                    # Add a check for None before trying to iterate
+                                    if order_response is None:
+                                        logger.error(f"Order response is None for {stockname}")   
+                                        return []                                 
+                                    # Skip this trade                                                                      
+                                    elif "error" in order_response:
+                                        logger.error(f"Not able to place order for {stockname}: {order_response['error']}")                                                                            
+                                    else:                                
+                                        # Create entry signal
+                                        entry = {
+                                            'entry_time': datetime.now(),
+                                            'entry_price': entry_price,
+                                            'stop_loss': stop_loss_price,
+                                            'pivot_level': pivot_level,
+                                            'ema10': df_sorted.iloc[-1]['ema10'] if 'ema10' in df_sorted.columns else None,
+                                            'entry_type': 'Breakout',
+                                            'entry_reason': f'Breakout above pivot {pivot_level:.2f} with {movement_percentage:.2f}% movement',
+                                            'movement_percentage': movement_percentage,
+                                            'sl_adjusted': False,
+                                            'quantity' : order_response['quantity'],
+                                            'symbol': stockname
+                                        }
+                                        
+                                        entries.append(entry)
+                                
+                                        # Update state
+                                        state['in_trade'] = True
+                                        state['stop_loss_price'] = stop_loss_price
+                                        ray.get(signal_tracker.set_used_pivot.remote(stockname, pivot_level)) 
+                                        # print("ADR: ", adr_value, "15th candle: ", 
+                                        #         "15th candle: ",ot,
+                                        #         "1st candle: ",nt)  
 
                                 except:
                                     logger.error("Not able to place order in strategy for ", stockname)                                 
@@ -1266,39 +1301,9 @@ def print_active_trades(active_trades, raw_conn, resampled_conn):
     # Get current prices from raw data
     current_prices = raw_conn.get_current_prices_batch(tokens_to_query)
     
-    # Get technical data for EMA values from resampled data
-    # resampled_data = resampled_conn.get_resampled_data_batch(tokens_to_query)
-    
-    # Store all EMAs in a dictionary first to prevent scope issues
-    # ema_values = {}
-    
-    # Calculate all EMAs first
-    # for symbol in active_trades.keys():
-    #     current_price = current_prices.get(symbol)
-    #     data = resampled_data.get(symbol, [])
-        
-    #     if data and current_price:
-    #         df = pd.DataFrame(data)
-    #         if not df.empty and 'ema10' in df.columns:
-    #             if 'timestamp' in df.columns:
-    #                 df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float)/1000, unit='s')
-    #                 df = df.sort_values('timestamp')
-                
-    #             latest_ema10 = df.iloc[-1]['ema10']
-    #             live_ema10 = calculate_live_ema(latest_ema10, current_price, 10)
-    #             ema_values[symbol] = live_ema10
-    
     # Now display rows using pre-calculated EMAs from our dictionary
     for symbol, trade in active_trades.items():
         current_price = current_prices.get(symbol)
-        
-        # Get the pre-calculated EMA value
-        # ema10_value = ema_values.get(symbol, 'N/A')
-        
-        # if isinstance(ema10_value, (int, float)):
-        #     ema10_display = f"{ema10_value:.2f}"
-        # else:
-        #     ema10_display = 'N/A'
         
         if current_price:
             pnl_percentage = ((current_price - trade['entry_price']) / trade['entry_price']) * 100
@@ -1395,7 +1400,7 @@ def check_for_exits(active_trades, raw_conn, resampled_conn, signal_tracker, ord
             if not df.empty and 'ema10' in df.columns:
                 previous_candle_ema10 = df.iloc[-1]['ema10']
                 live_ema10 = calculate_live_ema(previous_candle_ema10, current_price, 10)
-                print("EMA: ", live_ema10, "for ", symbol)
+                # print("EMA: ", live_ema10, "for ", symbol)
         
         # Check exit conditions
         stop_loss_hit = current_price <= trade['stop_loss']
@@ -1446,16 +1451,16 @@ def check_for_exits(active_trades, raw_conn, resampled_conn, signal_tracker, ord
                 }
                 
         if exit_data:
-            # try:
-            #     # Get the quantity to sell from the active trade
-            #     quantity_to_sell = trade.get('quantity', None)
-            #     if quantity_to_sell is None:
-            #         logger.error(f"Exit order for {symbol} failed: No quantity available in trade record")
-            #     else:
-            #         # Place the sell order with the same quantity as purchased
-            #         exit_order = ray.get(order_manager.place_order.remote(symbol, 'sell', quantity_to_sell))                                  
-            # except:
-            #     logger.error("Not able to place order in --check for exits-- for ", symbol)
+            try:
+                # Get the quantity to sell from the active trade
+                quantity_to_sell = trade.get('quantity', None)
+                if quantity_to_sell is None:
+                    logger.error(f"Exit order for {symbol} failed: No quantity available in trade record")
+                else:
+                    # Place the sell order with the same quantity as purchased
+                    exit_order = ray.get(order_manager.place_order.remote(symbol, 'sell', quantity_to_sell))                                  
+            except:
+                logger.error("Not able to place order in --check for exits-- for ", symbol)
             
             # Store the pivot level in the global dictionary
             if 'pivot_level' in trade and trade['pivot_level'] is not None:
@@ -1487,6 +1492,48 @@ def check_for_exits(active_trades, raw_conn, resampled_conn, signal_tracker, ord
 
     return len(trades_to_exit)
 
+ACTIVE_TRADES_DB = 2  # Database index for active trades monitoring
+TRADES_PREFIX = get_date_prefix() + "trades"  
+
+def update_active_trades_in_redis(active_trades):
+    try:
+        redis_client = redis.Redis(host='localhost', port=6379, db=ACTIVE_TRADES_DB)
+        
+        # Use the prefix to create the key
+        key = f"{TRADES_PREFIX}:active_trades"
+        
+        # Create a custom JSON encoder to handle datetime objects
+        class DateTimeEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, datetime):
+                    return obj.isoformat()
+                return super().default(obj)
+        
+        # Convert active_trades to JSON string using custom encoder
+        trades_json = json.dumps(active_trades, cls=DateTimeEncoder)
+        
+        # Store in Redis with timestamp as a field
+        redis_client.hset(key, mapping={
+            'timestamp': str(datetime.now().timestamp()),
+            'trades': trades_json
+        })
+        
+        redis_client.close()
+    except Exception as e:
+        logger.error(f"Error updating active trades in Redis: {str(e)}")
+
+def clear_active_trades_database():
+    try:
+        redis_client = redis.Redis(host='localhost', port=6379, db=ACTIVE_TRADES_DB)
+        redis_client.flushdb()
+        redis_client.close()
+        logger.info("Active trades database cleared successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Error clearing active trades database: {str(e)}")
+        return False
+
+
 def main():
     """
     Main function to run the trading system
@@ -1504,7 +1551,6 @@ def main():
         # Create a single order manager actor
         order_manager = OrderManager.remote()
 
-               
         # Create connection managers
         raw_conn = RedisConnectionManager(db=RAW_DB, pool_size=20)
         resampled_conn = RedisConnectionManager(db=RESAMPLED_DB, pool_size=20)
@@ -1512,7 +1558,7 @@ def main():
         logger.info("\nTrading system started...")
 
         # Batch the tokens to improve performance
-        batch_size = 10  # Adjust based on token count and system capacity
+        batch_size = 1  # Adjust based on token count and system capacity
         token_batches = batch_tokens(token_dict, batch_size)
         # logger.info(f"Processing {len(token_dict)} tokens in {len(token_batches)} batches")
 
@@ -1558,12 +1604,13 @@ def main():
             try:
                 # Get and print active trades
                 active_trades = ray.get(signal_tracker.get_active_trades.remote())
-                
-                # if should_print_active_trades():
-                print_active_trades(active_trades, raw_conn, resampled_conn)
+
+                # Update active trades in Redis for external monitoring
+                update_active_trades_in_redis(active_trades)                                            
                 
                 # Check for exits on active trades
                 if active_trades:
+                    # print_active_trades(active_trades, raw_conn, resampled_conn)
                     exits = check_for_exits(active_trades, raw_conn, resampled_conn, signal_tracker, order_manager)
                     if exits > 0:
                         logger.info(f"Exited {exits} positions")
@@ -1597,10 +1644,10 @@ def main():
                             stop_loss = signal['data']['stop_loss']
                             update_symbol_state_after_entry(symbol, stop_loss)
                 
-                process_end = time.time()
+                # process_end = time.time()
                 # Print summary statistics if it's time
                 # if should_print_stats():
-                run_duration = time.time() - run_start
+                # run_duration = time.time() - run_start
                 # print("\n")
                 # logger.info(f"Statistics summary: Completed {total_runs} runs since last report")
                 # logger.info(f"Last run duration: {run_duration:.2f} seconds")
@@ -1625,6 +1672,8 @@ def main():
         # Clean up resources
         try:
             logger.info("Cleaning up resources...")
+            if active_trades:
+                clear_active_trades_database()
             if 'raw_conn' in locals():
                 raw_conn.close()
             if 'resampled_conn' in locals():
@@ -1641,14 +1690,12 @@ if __name__ == "__main__":
         global token_dict
         # Initialize tokens
         token_dict = load_tokens()
-        # token_dict =  {"GODREJPROP25APR2100PE": "109662"}
-        # token_dict = {"DRREDDY25MAR1200CE": "105433"}
-        # token_dict = {"APOLLOTYRE25APR430CE": "66866"}
+
+        # token_dict = {"BEL25APR300CE": "94856"}
          # If no tokens were loaded, try to generate them
         if not token_dict:
             logger.info("No tokens loaded....")
-        
-        
+
         # Run the main function
         main()
         
