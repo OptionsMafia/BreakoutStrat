@@ -1,16 +1,4 @@
-/**
- * redis_resampler.c - Redis Market Data Resampler
- * 
- * This program resamples market data stored in Redis from raw ticker data
- * to 5-minute OHLCV candles, calculates technical indicators (pivots, EMAs),
- * and stores the results in a separate Redis database.
- * 
- * Compile with:
- * gcc -o redis_resampler redis_resampler.c -lhiredis -lm -lpthread
- */
-// Script is working with volume
-//
-//
+// Script to resample ticker data to 5 minute time frame and store it in redis database
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -473,39 +461,63 @@ int get_data_batch(TokenPair *tokens, int token_count, time_t since_timestamp, M
     
     // Allocate memory for return data
     *data = malloc(MAX_CANDLES * sizeof(MarketData));
+    if (*data == NULL) {
+        fprintf(stderr, "Error: Failed to allocate memory for data array\n");
+        return -1;  // Return error code
+    }
     *data_count = 0;
     
     long long redis_timestamp = (long long)since_timestamp * 1000;
     
+    // First, get all the keys in a pipeline
     for (int i = 0; i < token_count; i++) {
         char sorted_key[100];
         sprintf(sorted_key, "%s:%s:index", SOURCE_PREFIX, tokens[i].value);
         
-        // Check if index exists
-        redisReply *exists_reply = redisCommand(redis, "EXISTS %s", sorted_key);
-        if (!exists_reply || exists_reply->integer == 0) {
+        // Queue EXISTS command
+        redisAppendCommand(redis, "EXISTS %s", sorted_key);
+    }
+    
+    // Get EXISTS replies and queue ZRANGE/ZRANGEBYSCORE commands
+    for (int i = 0; i < token_count; i++) {
+        redisReply *exists_reply;
+        if (redisGetReply(redis, (void**)&exists_reply) != REDIS_OK || !exists_reply || exists_reply->integer == 0) {
             if (exists_reply) freeReplyObject(exists_reply);
             continue;
         }
         freeReplyObject(exists_reply);
         
-        // Get keys with timestamps greater than since_timestamp
-        redisReply *keys_reply;
-        if (since_timestamp > 0) {
-            keys_reply = redisCommand(redis, "ZRANGEBYSCORE %s %lld +inf", 
-                                      sorted_key, redis_timestamp);
-        } else {
-            keys_reply = redisCommand(redis, "ZRANGE %s 0 -1", sorted_key);
-        }
+        char sorted_key[100];
+        sprintf(sorted_key, "%s:%s:index", SOURCE_PREFIX, tokens[i].value);
         
-        if (!keys_reply || keys_reply->type != REDIS_REPLY_ARRAY) {
+        // Queue ZRANGE command
+        if (since_timestamp > 0) {
+            redisAppendCommand(redis, "ZRANGEBYSCORE %s %lld +inf", sorted_key, redis_timestamp);
+        } else {
+            redisAppendCommand(redis, "ZRANGE %s 0 -1", sorted_key);
+        }
+    }
+    
+    // Process ZRANGE/ZRANGEBYSCORE replies and queue HGETALL commands
+    for (int i = 0; i < token_count; i++) {
+        redisReply *keys_reply;
+        if (redisGetReply(redis, (void**)&keys_reply) != REDIS_OK || 
+            !keys_reply || keys_reply->type != REDIS_REPLY_ARRAY) {
             if (keys_reply) freeReplyObject(keys_reply);
             continue;
         }
         
-        // Process each key
+        // Queue HGETALL commands for each key
         for (size_t j = 0; j < keys_reply->elements && *data_count < MAX_CANDLES; j++) {
-            redisReply *data_reply = redisCommand(redis, "HGETALL %s", keys_reply->element[j]->str);
+            redisAppendCommand(redis, "HGETALL %s", keys_reply->element[j]->str);
+        }
+        
+        // Process each key's data
+        for (size_t j = 0; j < keys_reply->elements && *data_count < MAX_CANDLES; j++) {
+            redisReply *data_reply;
+            if (redisGetReply(redis, (void**)&data_reply) != REDIS_OK) {
+                continue;
+            }
             
             if (data_reply && data_reply->type == REDIS_REPLY_ARRAY && data_reply->elements >= 2) {
                 MarketData candle;
@@ -685,8 +697,6 @@ void prepare_dataframe(MarketData *data, int data_count, MarketData **resampled_
     // Find the earliest and latest timestamps
     long long earliest_ts = data[0].timestamp;
     long long latest_ts = data[data_count-1].timestamp;
-    // time_t now = time(NULL);
-    // long long latest_ts = (long long)now * 1000;
     
     // Calculate how many 5-minute intervals we need
     time_t earliest_time = earliest_ts / 1000;
@@ -734,69 +744,65 @@ void prepare_dataframe(MarketData *data, int data_count, MarketData **resampled_
         
         // Improved volume calculation with true interval volume
         double open = 0, high = 0, low = 0, close = 0;
-        double volume_at_start = 0.0;
-        double volume_at_end = 0.0;
+        double interval_volume = 0.0;
         bool first_value = true;
         bool found_data_in_interval = false;
-        int candle_data_count = 0;
         int first_idx_in_interval = -1;
         int last_idx_in_interval = -1;
 
-        // Find the last data point BEFORE this interval (for volume calculation)
-        int i = 0;
-        while (i < data_count && data[i].timestamp < interval_start_ms) {
-            volume_at_start = data[i].volume;  // Track volume of the last point before interval
-            i++;
-        }
-        
-        // Now i points to the first data point in or after the interval
-        first_idx_in_interval = i;
-        
-        // Process data points within this interval
-        for (; i < data_count; i++) {
-            // Break once we've passed this interval
-            if (data[i].timestamp >= interval_end_ms) {
-                break;
+        // Find data points within this interval
+        for (int i = 0; i < data_count; i++) {
+            if (data[i].timestamp >= interval_start_ms && data[i].timestamp < interval_end_ms) {
+                if (first_idx_in_interval == -1) {
+                    first_idx_in_interval = i;
+                }
+                last_idx_in_interval = i;
+                
+                // Initialize OHLC values on first point in interval
+                if (first_value) {
+                    open = data[i].open;
+                    high = data[i].high;
+                    low = data[i].low;
+                    first_value = false;
+                    found_data_in_interval = true;
+                } else {
+                    // Only compare high/low when needed
+                    if (data[i].high > high) high = data[i].high;
+                    if (data[i].low < low) low = data[i].low;
+                }
+                
+                // Always update close with the latest value in the interval
+                close = data[i].close;
+            } else if (data[i].timestamp >= interval_end_ms) {
+                break;  // Exit early once we're past the current interval
             }
-            
-            // Initialize OHLC values on first point in interval
-            if (first_value) {
-                open = data[i].open;
-                high = data[i].high;
-                low = data[i].low;
-                first_value = false;
-                found_data_in_interval = true;
-            } else {
-                // Only compare high/low when needed
-                if (data[i].high > high) high = data[i].high;
-                if (data[i].low < low) low = data[i].low;
-            }
-            
-            // Always update close and volume
-            close = data[i].close;
-            volume_at_end = data[i].volume;  // Track latest volume in interval
-            last_idx_in_interval = i;
-            candle_data_count++;
         }
 
         // Only create a candle if we have data for this interval
         if (found_data_in_interval) {
-            // Calculate true volume for this interval
-            double interval_volume;
-            
-            if (first_idx_in_interval > 0) {
-                // We have a previous point to calculate volume delta
-                interval_volume = volume_at_end - volume_at_start;
+            // Calculate volume as the difference between last and first point in the interval
+            if (first_idx_in_interval > 0 && last_idx_in_interval >= first_idx_in_interval) {
+                // We have previous data point to calculate delta from
+                interval_volume = data[last_idx_in_interval].volume - data[first_idx_in_interval-1].volume;
                 
-                // Handle potential day boundary (volume resets)
+                // Handle potential day boundary (volume resets) or data anomalies
                 if (interval_volume < 0) {
-                    // If we get a negative volume, just use the end volume directly
-                    // This assumes volume resets at the day boundary
-                    interval_volume = volume_at_end;
+                    // If we get a negative volume, just use the total volume in the interval
+                    interval_volume = data[last_idx_in_interval].volume - data[first_idx_in_interval].volume;
+                    
+                    // If still negative, fallback to end volume (for extreme cases)
+                    if (interval_volume < 0) {
+                        interval_volume = data[last_idx_in_interval].volume;
+                    }
                 }
             } else {
-                // No previous point, use the end volume directly
-                interval_volume = volume_at_end;
+                // First point in the dataset or isolated candle, use volume delta within interval
+                if (last_idx_in_interval > first_idx_in_interval) {
+                    interval_volume = data[last_idx_in_interval].volume - data[first_idx_in_interval].volume;
+                } else {
+                    // Single data point in interval, use its volume
+                    interval_volume = data[first_idx_in_interval].volume;
+                }
             }
             
             // Assign OHLCV values
@@ -804,7 +810,7 @@ void prepare_dataframe(MarketData *data, int data_count, MarketData **resampled_
             candle->high = high;
             candle->low = low;
             candle->close = close;
-            candle->volume = interval_volume;
+            candle->volume = interval_volume > 0 ? interval_volume : 0; // Ensure non-negative
             candle->ltp = close;
             
             interval_idx++;
@@ -820,39 +826,38 @@ void prepare_dataframe(MarketData *data, int data_count, MarketData **resampled_
         if ((*resampled_data)[i].high == 0) (*resampled_data)[i].high = (*resampled_data)[i].close;
         if ((*resampled_data)[i].low == 0)  (*resampled_data)[i].low = (*resampled_data)[i].close;
     }
-    
-    // Calculate pivot points
-    int *pivot_values = malloc(*resampled_count * sizeof(int));
-    optimize_pivot_calculations(*resampled_data, *resampled_count, pivot_values);
-    
-    // Apply pivot values and calculate pointpos
-    for (int i = 0; i < *resampled_count; i++) {
-        (*resampled_data)[i].pivot = pivot_values[i];
-        (*resampled_data)[i].pointpos = pointpos((*resampled_data)[i]);
-    }
-    
-    free(pivot_values);
-    
-    // Calculate EMAs
-    double *prices = malloc(*resampled_count * sizeof(double));
-    double *ema10 = malloc(*resampled_count * sizeof(double));
-    double *ema20 = malloc(*resampled_count * sizeof(double));
-    
-    for (int i = 0; i < *resampled_count; i++) {
-        prices[i] = (*resampled_data)[i].close;
-    }
-    
-    calculate_ema(prices, *resampled_count, 10, ema10);
-    calculate_ema(prices, *resampled_count, 20, ema20);
-    
-    for (int i = 0; i < *resampled_count; i++) {
-        (*resampled_data)[i].ema10 = ema10[i];
-        (*resampled_data)[i].ema20 = ema20[i];
-    }
-    
-    free(prices);
-    free(ema10);
-    free(ema20);
+   // Calculate pivot points
+   int *pivot_values = malloc(*resampled_count * sizeof(int));
+   optimize_pivot_calculations(*resampled_data, *resampled_count, pivot_values);
+   
+   // Apply pivot values and calculate pointpos
+   for (int i = 0; i < *resampled_count; i++) {
+       (*resampled_data)[i].pivot = pivot_values[i];
+       (*resampled_data)[i].pointpos = pointpos((*resampled_data)[i]);
+   }
+   
+   free(pivot_values);
+   
+   // Calculate EMAs
+   double *prices = malloc(*resampled_count * sizeof(double));
+   double *ema10 = malloc(*resampled_count * sizeof(double));
+   double *ema20 = malloc(*resampled_count * sizeof(double));
+   
+   for (int i = 0; i < *resampled_count; i++) {
+       prices[i] = (*resampled_data)[i].close;
+   }
+   
+   calculate_ema(prices, *resampled_count, 10, ema10);
+   calculate_ema(prices, *resampled_count, 20, ema20);
+   
+   for (int i = 0; i < *resampled_count; i++) {
+       (*resampled_data)[i].ema10 = ema10[i];
+       (*resampled_data)[i].ema20 = ema20[i];
+   }
+   
+   free(prices);
+   free(ema10);
+   free(ema20);
 }
 
 /**
@@ -919,6 +924,11 @@ void update_pivot_values(const char *token_name, const char *token_value, redisC
     
     // Fetch all candle data
     MarketData *candle_data = malloc(candles_reply->elements * sizeof(MarketData));
+    if (candle_data == NULL) {
+        fprintf(stderr, "Failed to allocate memory for candle data\n");
+        freeReplyObject(candles_reply);
+        return;
+    }
     int candle_count = 0;
     
     for (size_t i = 0; i < candles_reply->elements; i++) {
@@ -968,6 +978,12 @@ void update_pivot_values(const char *token_name, const char *token_value, redisC
     
     // Calculate pivot values (only for candles we need to update)
     int *pivot_values = malloc(candle_count * sizeof(int));
+    if (pivot_values == NULL) {
+        fprintf(stderr, "Failed to allocate memory for pivot values\n");
+        free(candle_data);
+        freeReplyObject(candles_reply);
+        return;
+    }
     optimize_pivot_calculations(candle_data, candle_count, pivot_values);
     
     // Track the latest pivot high
@@ -1018,6 +1034,9 @@ void update_pivot_values(const char *token_name, const char *token_value, redisC
     freeReplyObject(candles_reply);
 }
 
+
+
+
 /**
  * Store resampled data in Redis
  */
@@ -1032,24 +1051,47 @@ int store_resampled_data(MarketData *resampled_data, int count, const char *toke
     char index_key[100];
     sprintf(index_key, "%s:%s:index", RESAMPLED_PREFIX, token_value);
     
-    // Use pipeline to reduce network round-trips
+    // First, check which records already exist (in a pipeline)
+    char **data_keys = malloc(count * sizeof(char*));
+    int *exists_flags = calloc(count, sizeof(int));
+    int valid_count = 0;
+    
+    // Step 1: Create all keys and queue EXISTS commands
     for (int i = 0; i < count; i++) {
         // Skip intervals that fall before 9:15 market open
         time_t candle_time = resampled_data[i].timestamp / 1000;
         struct tm *tm_candle = localtime(&candle_time);
         
         if (tm_candle->tm_hour == 9 && (tm_candle->tm_min == 5 || tm_candle->tm_min == 10)) {
+            data_keys[i] = NULL;
             continue;
         }
         
         // Create hash key for this data point
-        char data_key[100];
-        sprintf(data_key, "%s:%s:%lld", RESAMPLED_PREFIX, token_value, resampled_data[i].timestamp);
+        data_keys[i] = malloc(100);
+        sprintf(data_keys[i], "%s:%s:%lld", RESAMPLED_PREFIX, token_value, resampled_data[i].timestamp);
         
-        // Check if this interval already exists
-        redisReply *exists_reply = redisCommand(redis_context, "EXISTS %s", data_key);
-        int exists = (exists_reply && exists_reply->integer == 1);
-        if (exists_reply) freeReplyObject(exists_reply);
+        // Queue EXISTS command (don't execute yet)
+        redisAppendCommand(redis_context, "EXISTS %s", data_keys[i]);
+        valid_count++;
+    }
+    
+    // Step 2: Get all EXISTS replies
+    for (int i = 0; i < count; i++) {
+        if (data_keys[i] != NULL) {
+            redisReply *exists_reply;
+            if (redisGetReply(redis_context, (void**)&exists_reply) == REDIS_OK) {
+                exists_flags[i] = (exists_reply && exists_reply->integer == 1) ? 1 : 0;
+                freeReplyObject(exists_reply);
+            }
+        }
+    }
+    
+    // Step 3: Queue all HMSET commands
+    for (int i = 0; i < count; i++) {
+        if (data_keys[i] == NULL) {
+            continue;
+        }
         
         // Prepare pivot_candle_index value
         char pivot_index_str[20] = "";
@@ -1057,10 +1099,10 @@ int store_resampled_data(MarketData *resampled_data, int count, const char *toke
             sprintf(pivot_index_str, "%d", i);
         }
         
-        // Use a single HMSET command to set all fields at once
-        redisReply *reply = redisCommand(redis_context, 
+        // Queue HMSET command (don't execute yet)
+        redisAppendCommand(redis_context, 
             "HMSET %s symbol %s timestamp %lld open %f high %f low %f close %f adjVol %f ltp %f pivot %d pivot_candle_index %s ema10 %f ema20 %f",
-            data_key, 
+            data_keys[i], 
             token_name,
             resampled_data[i].timestamp,
             resampled_data[i].open,
@@ -1075,17 +1117,41 @@ int store_resampled_data(MarketData *resampled_data, int count, const char *toke
             resampled_data[i].ema20
         );
         
-        if (reply) freeReplyObject(reply);
-        
-        // Add to sorted set index if it's a new record
-        if (!exists) {
-            redisReply *zadd_reply = redisCommand(redis_context, "ZADD %s %lld %s", 
-                        index_key, resampled_data[i].timestamp, data_key);
-            if (zadd_reply) freeReplyObject(zadd_reply);
+        // Queue ZADD command if it's a new record
+        if (!exists_flags[i]) {
+            redisAppendCommand(redis_context, "ZADD %s %lld %s", 
+                index_key, resampled_data[i].timestamp, data_keys[i]);
         }
         
         stored_count++;
     }
+    
+    // Step 4: Process all replies from HMSET commands
+    for (int i = 0; i < count; i++) {
+        if (data_keys[i] != NULL) {
+            redisReply *hmset_reply;
+            if (redisGetReply(redis_context, (void**)&hmset_reply) == REDIS_OK) {
+                freeReplyObject(hmset_reply);
+            }
+            
+            // Process ZADD reply if it was a new record
+            if (!exists_flags[i]) {
+                redisReply *zadd_reply;
+                if (redisGetReply(redis_context, (void**)&zadd_reply) == REDIS_OK) {
+                    freeReplyObject(zadd_reply);
+                }
+            }
+        }
+    }
+    
+    // Clean up
+    for (int i = 0; i < count; i++) {
+        if (data_keys[i] != NULL) {
+            free(data_keys[i]);
+        }
+    }
+    free(data_keys);
+    free(exists_flags);
     
     return stored_count;
 }
@@ -1272,10 +1338,10 @@ void run_resampler() {
     // Main resampling loop
     while (1) {
         // Check if market is still open
-        if (!is_market_open()) {
-            printf("Market is closed. Exiting.\n");
-            break;
-        }
+        // if (!is_market_open()) {
+        //     printf("Market is closed. Exiting.\n");
+        //     break;
+        // }
         
         // Calculate next run time (aligned to 5-minute intervals)
         time_t next_run = get_next_run_time(RESAMPLE_INTERVAL);
@@ -1308,6 +1374,11 @@ void run_resampler() {
             if (end_idx > token_count) end_idx = token_count;
             
             ThreadData *thread_data = malloc(sizeof(ThreadData));
+            if (thread_data == NULL) {
+                fprintf(stderr, "Failed to allocate memory for thread data\n");
+                // Consider how to handle this in the main loop - perhaps retry or skip this batch
+                continue;  // Skip this batch if we can't allocate memory
+            }
             thread_data->tokens = &tokens[start_idx];
             thread_data->token_count = end_idx - start_idx;
             thread_data->last_run_time = last_run_time;
