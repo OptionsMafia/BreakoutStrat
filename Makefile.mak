@@ -14,7 +14,7 @@ TARGET = redis_resampler
 all: $(TARGET)
 
 $(TARGET): redis_resampler.c
-	$(CC) $(CFLAGS) -o $(TARGET) redis_resampler_v1.c $(LDFLAGS) $(LIBS)
+	$(CC) $(CFLAGS) -o $(TARGET) redis_resampler.c $(LDFLAGS) $(LIBS)
 
 clean:
 	rm -f $(TARGET)
