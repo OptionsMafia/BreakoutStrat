@@ -1,6 +1,5 @@
 '''
-pivot sliding window
-Added flattrade configs to fetch historical data instead of using angelone API
+pivot sliding window with historical data
 '''
 import redis
 import time
@@ -13,6 +12,12 @@ import logging
 import threading
 import ray
 import flattrade_config
+
+# Constants
+SOURCE_DB = 0  # Database index for raw ticker data (18mar2025)
+RESAMPLED_DB = 1  # Database index for resampled data (19mar2025resampled)
+
+RESAMPLE_INTERVAL = "5Min"
 
 # Get authenticated API and token
 api, token = flattrade_config.get_flattrade_api()
@@ -34,12 +39,6 @@ def get_date_prefix():
     month = now.strftime("%b").lower()
     year = now.strftime("%Y")
     return f"{day}{month}{year}"
-
-# Constants
-SOURCE_DB = 0  # Database index for raw ticker data (18mar2025)
-RESAMPLED_DB = 1  # Database index for resampled data (19mar2025resampled)
-
-RESAMPLE_INTERVAL = "5Min"
 
 def load_tokens():
     """
@@ -81,7 +80,6 @@ def load_tokens():
     except Exception as e:
         logger.error(f"Error loading token dictionary: {str(e)}")
         return {}
-
 
 # Create a Redis connection manager for better connection handling
 class RedisConnection:
@@ -212,10 +210,7 @@ def prepare_dataframe(data):
     df['pointpos'] = df.apply(lambda row: pointpos(row), axis=1)
     
     # Calculate EMAs
-    # span10 = 2 / (10 + 1)
-    # span20 = 2 / (20 + 1)
-    # df['ema10'] = df['close'].ewm(alpha=span10, adjust=False).mean()
-    # df['ema20'] = df['close'].ewm(alpha=span20, adjust=False).mean()
+
     df['ema10'] = calculate_ema(df['close'].values, 10)
     df['ema20'] = calculate_ema(df['close'].values, 20)
     
@@ -233,34 +228,15 @@ def optimize_pivot_calculations(df):
     # Pre-allocate the results array
     pivot_values = np.zeros(n_rows, dtype=np.int8)
     
-    # Extract high and low values as numpy arrays for fast comparison
+    # Extract high and low values as numpy arrays
     highs = df['high'].values
     lows = df['low'].values
     
     # We can only calculate pivots for rows that have enough data before and after
     for i in range(lookback, n_rows - lookforward):
-        # Check if current high is greater than all highs in the window
-        current_high = highs[i]
-        is_pivot_high = True
-        
-        # Check previous candles
-        for j in range(i - lookback, i):
-            if current_high <= highs[j]:
-                is_pivot_high = False
-                break
-                
-        # If still potentially a pivot high, check forward candles
-        if is_pivot_high:
-            for j in range(i + 1, i + lookforward + 1):
-                if current_high <= highs[j]:
-                    is_pivot_high = False
-                    break
-        
-        # If it's a pivot high, mark it as 2 in our results
-        if is_pivot_high:
-            pivot_values[i] = 2
-            
-        # Similar logic for pivot lows can be added here if needed
+        # Vectorized comparison for pivot highs
+        if np.all(highs[i] > highs[i-lookback:i]) and np.all(highs[i] > highs[i+1:i+lookforward+1]):
+            pivot_values[i] = 2  # Pivot high
     
     return pivot_values
 
@@ -413,6 +389,7 @@ def update_historical_pivot_values(token_name, token_value, resampled_client):
     if pivot_updates > 0:
         update_pipe.execute()
 
+
 def load_historical_data(token_dict, days_back=10):
     """
     Fetches historical data for tokens and adds them to the resampled database
@@ -438,6 +415,7 @@ def load_historical_data(token_dict, days_back=10):
         lastBusDay = datetime.today()-timedelta(days=BusDay)
         start_lastBusDay = lastBusDay.replace(hour=9, minute=15, second=0, microsecond=0)
         end_lastBusDay = lastBusDay.replace(hour=15, minute=30, second=0, microsecond=0)
+        # print(lastBusDay, start_lastBusDay, end_lastBusDay)
 
         # Try to get data for a reference token to check if the day has data
 
@@ -448,7 +426,7 @@ def load_historical_data(token_dict, days_back=10):
             df = pd.DataFrame(ret)
             df = df[::-1]
 
-            if len(df) > 10:
+            if len(df) > 1:
                 break
 
         except Exception as e:
@@ -458,7 +436,7 @@ def load_historical_data(token_dict, days_back=10):
         if BusDay > days_back:  # Avoid infinite loop
             logger.error(f"Could not find a valid business day within {days_back} days")
             return
-
+    
     for token_name,token_value in token_dict.items():
         try:
             ret = api.get_time_price_series(exchange='NFO', token=token_value,
@@ -502,7 +480,7 @@ def load_historical_data(token_dict, days_back=10):
                     # Store the resampled data
                     stored_count = store_historical_resampled_data(resampled_df, token_name, token_value, 
                                                                   resampled_client, lot_size)
-                    logger.info(f"Loaded historical data for {token_name}: {stored_count} candles")
+                    logger.info(f"Loaded historical data for {token_name}: {stored_count} candles for the date {lastBusDay}")
                     
                     # Update pivot values
                     update_historical_pivot_values(token_name, token_value, resampled_client)
@@ -1072,43 +1050,6 @@ def process_token_batch(token_batch, last_run_time=None):
         if resampled_client:
             resampled_client.close()
 
-def pivotid(row_idx, df1, n1, n2):
-    """
-    Detect pivot points by comparing with surrounding candles
-
-    Args:
-        row_idx: current row index
-        df1: DataFrame containing OHLC data
-        n1: number of candles to look back
-        n2: number of candles to look forward
-    """
-    if row_idx - n1 < 0 or row_idx + n2 >= len(df1):
-        return 0
-
-    current_high = df1.iloc[row_idx]['high']
-
-    # Check if current_high is NaN
-    if pd.isna(current_high):
-        return 0
-
-    # Check previous n1 candles
-    for i in range(row_idx - n1, row_idx):
-        # Skip NaN values
-        if pd.isna(df1.iloc[i]['high']):
-            continue
-        if current_high <= df1.iloc[i]['high']:
-            return 0
-
-    # Check next n2 candles
-    for i in range(row_idx + 1, row_idx + n2 + 1):
-        if pd.isna(df1.iloc[i]['high']):
-            continue
-        if current_high <= df1.iloc[i]['high']:
-            return 0
-
-    # If all checks passed, this is a pivot high
-    return 2
-
 def pointpos(x):
     if x['pivot']==1:
         return x['low']-1e-3
@@ -1196,7 +1137,7 @@ def store_historical_resampled_data(resampled_data, token_name, token_value, res
     
     return stored_count
 
-_FIRST_RUN_COMPLETED = False
+# _FIRST_RUN_COMPLETED = False
 
 def store_resampled_data(resampled_data, token_name, token_value, resampled_client):
     """
@@ -1217,7 +1158,7 @@ def store_resampled_data(resampled_data, token_name, token_value, resampled_clie
     
     prefix = RESAMPLED_PREFIX
     stored_count = 0
-    global _FIRST_RUN_COMPLETED
+    # global _FIRST_RUN_COMPLETED
     
     # Create a pipeline for bulk operations
     pipe = resampled_client.pipeline(transaction=False)
@@ -1231,11 +1172,13 @@ def store_resampled_data(resampled_data, token_name, token_value, resampled_clie
         timestamp = int(row['timestamp'].timestamp() * 1000)  # Convert to milliseconds
         # print(f"DEBUG: Storing row with timestamp={timestamp}, adjVol={row['adjVol']}")
 
+        # To skip the time before 9:15
         candle_time = row['timestamp'].time()
+        
         # if (candle_time.hour == 9 and candle_time.minute == 5) or (candle_time.hour == 9 and candle_time.minute == 10):
         #     continue
-        # To skip the time before 9;15
-        if not _FIRST_RUN_COMPLETED and candle_time.hour == 9 and candle_time.minute in (5, 10):
+        
+        if candle_time.hour == 9 and candle_time.minute in (5, 10):
             continue
         
         # Create hash key for this data point
@@ -1280,14 +1223,14 @@ def store_resampled_data(resampled_data, token_name, token_value, resampled_clie
         stored_count += 1
     
     # Mark first run as completed
-    _FIRST_RUN_COMPLETED = True
+    # _FIRST_RUN_COMPLETED = True
 
     # Execute pipeline
     pipe.execute()
     
     return stored_count
 
-def batch_tokens(token_dict, batch_size=25):
+def batch_tokens(token_dict, batch_size=50):
     """
     Split token dictionary into batches
     
@@ -1443,7 +1386,7 @@ def run_resampler():
     
     # Load tokens
     tokens = load_tokens()
-    # tokens = {"ADANIGREEN25APR900PE": "64625"}
+    # tokens = {"SIEMENS25MAY2900PE": "41423"}
     if not tokens:
         logger.error("No tokens loaded. Exiting.")
         return
@@ -1451,104 +1394,105 @@ def run_resampler():
     now = datetime.now()
 
     # Skip processing if market is closed
-    if not (9 <= now.hour and now.minute <= 10):   
-        try:
-            with RedisConnection(db=RESAMPLED_DB) as resampled_client:
-                # Check if there are any keys matching the resampled data pattern
-                index_keys = resampled_client.keys(f"{RESAMPLED_PREFIX}:*:index")
-                
-                # If no index keys exist, the database is empty
-                if len(index_keys) == 0:
-                    logger.info("Loading historical data before starting incremental updates")
-                    load_historical_data(tokens, days_back=10) 
+    # if not (9 <= now.hour and now.minute <= 10):   
+    try:
+        with RedisConnection(db=RESAMPLED_DB) as resampled_client:
+            # Check if there are any keys matching the resampled data pattern
+            index_keys = resampled_client.keys(f"{RESAMPLED_PREFIX}:*:index")
+            
+            # If no index keys exist, the database is empty
+            if len(index_keys) == 0:
+                logger.info("Loading historical data before starting incremental updates")
+                load_historical_data(tokens, days_back=10) 
 
-        except Exception as e:
-            logger.error(f"Error: {str(e)}")   
-    else:
-        logger.info("Market is closed. Bye")      
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")   
+    # else:
+    #     logger.info("Market is closed. Bye")  
+   
  
             
     # Initialize last_run_time to current time minus 5 minutes to get recent data on first run
-    last_run_time = time.time() - 43200    # 12 hr ago
+    last_run_time = time.time() - 432000000    # 12 hr ago
 
     print("\n")
 
-    logger.info("Starting Live Data Resampling")
+    # logger.info("Starting Live Data Resampling")
     
     try:
-        market_open_time = datetime.strptime('09:15', '%H:%M').time()
+        # market_open_time = datetime.strptime('09:15', '%H:%M').time()
 
-        while True:    
-            now = datetime.now()   
-            current_time = now.time()       
-            if current_time >= market_open_time:
-                break
+        # while True:    
+        #     now = datetime.now()   
+        #     current_time = now.time()       
+        #     if current_time >= market_open_time:
+        #         break
             
 
-        while True:                        
+        # while True:                        
 
-            # Skip processing if market is closed
-            # if not is_market_open() or not (9 <= now.hour <= 15 and now.minute > 30):
-            #     logger.info("Market is closed. Bye")
-            #     break
+        #     # Skip processing if market is closed
+        #     # if not is_market_open() or not (9 <= now.hour <= 15 and now.minute > 30):
+        #     #     logger.info("Market is closed. Bye")
+        #     #     break
 
-            # Calculate next run time (aligned to 5-minute intervals)
-            next_run, wait_seconds = get_next_run_time(5)
+        #     # Calculate next run time (aligned to 5-minute intervals)
+        #     next_run, wait_seconds = get_next_run_time(5)
 
-            logger.info(f"Next resampling run scheduled at {next_run} ({wait_seconds:.0f} seconds from now)")
+        #     logger.info(f"Next resampling run scheduled at {next_run} ({wait_seconds:.0f} seconds from now)")
             
-            # Wait until next run time
-            time.sleep(wait_seconds)
+        #     # Wait until next run time
+        #     time.sleep(wait_seconds)
             
-            run_start = time.time()
-            now = datetime.now()
+        #     run_start = time.time()
+        #     now = datetime.now()
   
-            logger.info(f"\nStarting incremental resampling run at {now}")
+        #     logger.info(f"\nStarting incremental resampling run at {now}")
 
-            # Process tokens in batches
-            token_batches = batch_tokens(tokens, batch_size=50)
-            logger.info(f"Processing {len(token_batches)} batches of tokens in parallel - Using data since {datetime.fromtimestamp(last_run_time)}")
+        #     # Process tokens in batches
+        #     token_batches = batch_tokens(tokens, batch_size=50)
+        #     logger.info(f"Processing {len(token_batches)} batches of tokens in parallel - Using data since {datetime.fromtimestamp(last_run_time)}")
             
-            # Submit all batch processing tasks to Ray with the last run time
-            futures = [process_token_batch.remote(batch, last_run_time) for batch in token_batches]
+        #     # Submit all batch processing tasks to Ray with the last run time
+        #     futures = [process_token_batch.remote(batch, last_run_time) for batch in token_batches]
             
-            # Process results as they complete
-            total_stored = 0
-            completed_batches = 0
+        #     # Process results as they complete
+        #     total_stored = 0
+        #     completed_batches = 0
             
-            # Wait for all futures to complete
-            batch_results = []
-            while futures:
-                done_futures, futures = ray.wait(futures, timeout=5.0)
+        #     # Wait for all futures to complete
+        #     batch_results = []
+        #     while futures:
+        #         done_futures, futures = ray.wait(futures, timeout=5.0)
                 
-                if done_futures:
-                    for future in done_futures:
-                        try:
-                            result = ray.get(future)
-                            batch_results.append(result)
+        #         if done_futures:
+        #             for future in done_futures:
+        #                 try:
+        #                     result = ray.get(future)
+        #                     batch_results.append(result)
                             
-                            # Count stored items
-                            batch_stored = sum(r.get('count', 0) for r in result.values() 
-                                             if isinstance(r, dict) and 'count' in r)
-                            total_stored += batch_stored
-                            completed_batches += 1
+        #                     # Count stored items
+        #                     batch_stored = sum(r.get('count', 0) for r in result.values() 
+        #                                      if isinstance(r, dict) and 'count' in r)
+        #                     total_stored += batch_stored
+        #                     completed_batches += 1
                             
-                            # Log errors
-                            errors = [f"{token}: {data['message']}" for token, data in result.items() 
-                                    if isinstance(data, dict) and data.get('status') == 'error']
-                            if errors:
-                                logger.warning(f"Errors in batch {completed_batches}: {', '.join(errors)}")
+        #                     # Log errors
+        #                     errors = [f"{token}: {data['message']}" for token, data in result.items() 
+        #                             if isinstance(data, dict) and data.get('status') == 'error']
+        #                     if errors:
+        #                         logger.warning(f"Errors in batch {completed_batches}: {', '.join(errors)}")
                                 
-                        except Exception as e:
-                            logger.error(f"Error processing batch result: {str(e)}")
+        #                 except Exception as e:
+        #                     logger.error(f"Error processing batch result: {str(e)}")
             
-            run_duration = time.time() - run_start
-            logger.info(f"Completed incremental resampling run in {run_duration:.2f} seconds. Stored/updated {total_stored} records.")
+        #     run_duration = time.time() - run_start
+        #     logger.info(f"Completed incremental resampling run in {run_duration:.2f} seconds. Stored/updated {total_stored} records.")
             
-            # Update last run time to the start of this run
-            last_run_time = run_start
-            # time.sleep(1000)
-            gc.collect()
+        #     # Update last run time to the start of this run
+        #     last_run_time = run_start
+        #     # time.sleep(1000)
+        gc.collect()
             
     except KeyboardInterrupt:
         logger.info("Resampler stopped by user")
@@ -1605,7 +1549,7 @@ def print_token_data(token_name, token_value):
     resampled_client = redis.Redis(host='localhost', port=6379, db=RESAMPLED_DB, decode_responses=True)
     with RedisConnection(db=SOURCE_DB) as source_client, RedisConnection(db=RESAMPLED_DB) as resampled_client:
     
-        # Set pandas display options
+        # # Set pandas display options
         pd.set_option('display.max_rows', None)
         pd.set_option('display.max_columns', None)
         pd.set_option('display.width', None)
@@ -1718,16 +1662,16 @@ if __name__ == "__main__":
     import argparse
     global SOURCE_PREFIX # "18mar2025"
     global RESAMPLED_PREFIX # "19mar2025resampled" 
-
-    # Use for clearing the database
-    # clear_resampled_database()
-
-
+    
     SOURCE_PREFIX = get_date_prefix()
     RESAMPLED_PREFIX = get_date_prefix() + "resampled"
+    # RESAMPLED_PREFIX = "2may2025resampled" #get_date_prefix() + "resampled"
 
-    # tokens = {"ADANIGREEN25APR900PE": "64625"}
-    # # tokens = load_tokens() 
+    # Use for clearing the database
+    clear_resampled_database()
+
+    # tokens = {"DIXON25MAY15000PE": "80011"}
+    # # # tokens = load_tokens() 
     
     # if tokens:
     #     # Print data for the first token
