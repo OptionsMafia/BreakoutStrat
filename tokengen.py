@@ -3,7 +3,6 @@ import zipfile
 import io
 import pandas as pd
 import os
-import time
 import json
 import urllib
 from datetime import datetime as dt
@@ -21,6 +20,7 @@ def fetch_token(query, exchange):
         temp_symbol = items['symbol']
         # if temp_symbol == query:
         #     print("hi")
+        
         if query in temp_symbol and temp_exchange == exchange:
             token = items['token']
             return token
@@ -71,6 +71,7 @@ def download_and_extract_nse_data(url, output_dir='.', max_retries=5):
         print("Attempting download with browser-like headers...")
 
         response = session.get(url, headers=headers, timeout=30)
+        print(response)
         response.raise_for_status()
 
         # Extract the zip file
@@ -89,7 +90,6 @@ def download_and_extract_nse_data(url, output_dir='.', max_retries=5):
 
         # Read the CSV into a pandas DataFrame
         df = pd.read_csv(csv_file)
-
         # Return both the dataframe and the path to the extracted file
         return df, csv_file
 
@@ -155,78 +155,25 @@ def try_alternative_download(url, output_dir='.'):
         print(f"Alternative download method failed: {e}")
         return None, None
 
-from datetime import datetime, timedelta, date
+from datetime import datetime
 
-def get_fourth_week_thursday():
-    """
-    Returns the date of the 4th week's Thursday (or Wednesday as fallback) in multiple formats:
-    1. 'YYYY-MM-DD' (e.g., '2025-03-27')
-    2. 'YYMM' (e.g., '25MAR')
-    3. 'DDMMYY' (e.g., '27MAR25')
+def get_fourth_week_thursday(b_df):
 
-    Returns the current month's date if it hasn't passed yet, otherwise returns next month's date.
-    """
     # Get current date
     today = datetime.now()
-
-    # Function to get 4th week's Thursday for a specific year and month
-    def get_thursday_for_month(year, month):
-        # Find the first day of the specified month
-        first_day = date(year, month, 1)
-
-        # Find the first Thursday of the month
-        # (weekday 3 = Thursday, where Monday=0, Sunday=6)
-        days_until_first_thursday = (3 - first_day.weekday()) % 7
-        first_thursday = first_day + timedelta(days=days_until_first_thursday)
-
-        # The Thursday of the 4th week would be 3 weeks after the first Thursday
-        fourth_thursday = first_thursday + timedelta(weeks=3)
-
-        # Check if the 4th Thursday is still in the specified month
-        if fourth_thursday.month != month:
-            # If not, get the Wednesday of the 4th week instead
-            fourth_wednesday = first_thursday + timedelta(weeks=3, days=-1)
-            if fourth_wednesday.month == month:
-                return fourth_wednesday
-            else:
-                # If neither Thursday nor Wednesday of 4th week is in the month,
-                # get the last Thursday of the month
-                last_day = date(year, month + 1, 1) - timedelta(days=1)
-                days_to_subtract = (last_day.weekday() - 3) % 7
-                last_thursday = last_day - timedelta(days=days_to_subtract)
-                return last_thursday
-
-        return fourth_thursday
-
-    # Get 4th week's Thursday for current month
-    current_year = today.year
-    current_month = today.month
-    current_month_thursday = get_thursday_for_month(current_year, current_month)
-
-
-    # Check if today has passed this date
-    if today.date() < (current_month_thursday - timedelta(days=3)):
-        # If not passed, return current month's date
-        target_date = current_month_thursday
-    else:
-        # If passed, calculate next month's date
-        next_month = current_month + 1
-        next_year = current_year
-        if next_month > 12:
-            next_month = 1
-            next_year += 1
-
-        target_date = get_thursday_for_month(next_year, next_month)
-
+    t_df = b_df[b_df["TckrSymb"].str.startswith("RELIANCE")]
+    t_df = t_df["XpryDt"]
+    expiry = sorted(set(t_df.tolist()))[0]
     # Generate the different date formats
     month_names = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
                    "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-    month_name = month_names[target_date.month - 1]
+   
 
-    expiry = target_date.strftime('%Y-%m-%d')  # YYYY-MM-DD
-    format2 = f"{str(target_date.year)[2:4]}{month_name}"  # YYMM (25MAR)
-    format3 = f"{target_date.day}{month_name}{str(target_date.year)[2:4]}"  # DDMMYY (27MAR25)
-
+    expiry = "2025-05-29"  # YYYY-MM-DD
+    t_exp = expiry.split("-")
+    month_name = month_names[int(t_exp[1]) - 1]
+    format2 = f"{str(t_exp[0])[2:4]}{month_name}"  # YYMM (25MAR)
+    format3 = f"{t_exp[2]}{month_name}{str(str(t_exp[0]))[2:4]}"  # DDMMYY (27MAR25)
     return expiry, format2, format3
 
 
@@ -265,7 +212,7 @@ def main():
         if df is not None and len(df) > 10:
             break
 
-    expiry, yearmonth, datemonthyear = get_fourth_week_thursday()
+    expiry, yearmonth, datemonthyear = get_fourth_week_thursday(df)
     temp_df  = df[df["XpryDt"].str.startswith(expiry)]
     temp_df = temp_df[temp_df["FinInstrmTp"].str.startswith("STO")]
 
@@ -302,6 +249,7 @@ def main():
     
     # Take only the tokens after the first 200
     limited_tokens = dict(list(sorted_tokens.items())[:200])
+    # limited_tokens = dict(list(sorted_tokens.items()))
 
     # Create tokens directory if it doesn't exist
     tokens_dir = os.path.join(os.getcwd(), "tokens")
