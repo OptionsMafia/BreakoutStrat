@@ -112,8 +112,22 @@ class OrderManager:
         self.budget = 5000
         # Leverage factor for MIS orders
         self.leverage_factor = 4.543
-        self.max_risk = 20
+        self.max_risk = 100
 
+    def get_position_book(self):
+        """
+        Get current position book from Flattrade API
+        
+        Returns:
+            list: List of positions or None if error
+        """
+        try:
+            positions = self.api.get_positions()
+            return positions if positions else []
+        except Exception as e:
+            logger.error(f"Error getting position book: {str(e)}")
+            return None
+        
     def calculate_quantity(self, entry_price, stockname):
         """
         Calculate the optimal quantity based on fixed risk and 1% stop loss
@@ -818,7 +832,7 @@ def get_next_run_time(interval_seconds=30):
     return next_run, seconds_to_wait
 
 @ray.remote
-def process_token_batch(token_batch, signal_tracker, order_manager):
+def process_token_batch(token_batch, signal_tracker, order_manager, active_trades):
     """
     Process a batch of tokens in parallel
     
@@ -849,6 +863,7 @@ def process_token_batch(token_batch, signal_tracker, order_manager):
         # Process each token
         for token_name, token_value in token_batch.items():
             try:
+                # strategy_start_time = time.time()
 
                 state = ray.get(signal_tracker.get_symbol_state.remote(token_name))                
 
@@ -885,7 +900,7 @@ def process_token_batch(token_batch, signal_tracker, order_manager):
                     df = df.sort_values('timestamp')
                 
                 # Apply the strategy 
-                entries = strategy(df, token_name, pivot_info, current_price, signal_tracker, order_manager)
+                entries = strategy(df, token_name, pivot_info, current_price, signal_tracker, order_manager, active_trades)
                 
                 # Process entries
                 for entry in entries:
@@ -920,6 +935,12 @@ def process_token_batch(token_batch, signal_tracker, order_manager):
                             }
                             all_signals.append(exit_signal)
                             ray.get(signal_tracker.reset_symbol_state.remote(token_name))
+                # strategy_end_time = time.time()
+                # execution_time = strategy_end_time - strategy_start_time                    
+                
+                # # Log the timing information
+                # print(f"Strategy execution time for {token_name}: {execution_time:.4f} seconds")
+                    
                             
             except Exception as e:
                 logger.error(f"Error processing token {token_name}: {str(e)}")
@@ -1057,8 +1078,47 @@ def calculate_adr(df):
     except Exception as e:
         logger.error(f"Error calculating ADR: {str(e)}")
         return None
+
+
+# Simple global cache with timestamp
+_position_cache = {'data': {}, 'time': 0}
+
+def check_existing_position(stockname, order_manager):
+    """
+    Fast position check with 3-second cache
     
-def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_manager):
+    Args:
+        stockname (str): Token name like "BHARATFORG25MAY1320CE"
+        order_manager: Ray actor for API access
+        
+    Returns:
+        bool: True if position exists
+    """
+    current_time = time.time()
+    
+    # Refresh cache every 3 seconds
+    if current_time - _position_cache['time'] > 3:
+        try:
+            positions = ray.get(order_manager.get_position_book.remote())
+            # Convert to dict for fast lookup: {symbol: netqty}
+            _position_cache['data'] = {
+                pos.get('tsym'): int(pos.get('netqty', 0)) 
+                for pos in (positions or []) 
+                if pos.get('tsym') and pos.get('netqty', '0') != '0'
+            }
+            _position_cache['time'] = current_time
+        except:
+            # Keep old cache on error
+            pass
+    
+    # Convert stockname: "BHARATFORG25MAY1320CE" -> "BHARATFORG-EQ"
+    stock_name = stockname.split('25')[0] + '-EQ'
+    
+    # Fast O(1) lookup
+    return stock_name in _position_cache['data']
+
+
+def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_manager, active_trades):
     """
     Strategy using pre-calculated pivot points
     
@@ -1074,12 +1134,22 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
     # Get state for this symbol
     state = get_symbol_state(stockname)
 
+    if stockname in active_trades:
+        return []  # Skip if already in trade
+    
+    # Using the flattrade position book to see the existing position
+    # if check_existing_position(stockname, order_manager):
+    #     return []  # Skip if position already exists
+    
     # Skip if already in a trade
     if state['in_trade']:
         return []    
     
     # Early return for empty dataframe
     if len(df) == 0:
+        return []
+    
+    if current_price < 2:
         return []
     
     # import pandas as pd
@@ -1179,17 +1249,26 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
                 return []
 
             # Check if current price has broken above the pivot level
-            if current_price > pivot_level and check_ema_conditions(df, current_price): #and current_price > live_ema10:                               
+            if current_price > pivot_level and check_ema_conditions(df, current_price) and current_price > live_ema10:                               
                 
-                # Calculate movement percentage (10-candle lookback)
+                # Calculate movement percentage (10-candle lookback from the pivot)
                 if len(df) >= 12:
                     # Sort to ensure we're using the right order
                     df_sorted = df.sort_values('timestamp')
-                    recent_df = df_sorted.iloc[-11:]
                     
-                    tenth_prev_close = float(recent_df.iloc[0]['close'])
-                    
-                    current_close = float(recent_df.iloc[-1]['close'])
+                    pivot_candles = df_sorted[df_sorted['pivot'] == 2]
+                    if len(pivot_candles) == 0:
+                        return []
+
+                    pivot_idx = pivot_candles.index[-1]
+                    pivot_pos = df_sorted.index.get_loc(pivot_idx)
+
+                    if pivot_pos < 10:
+                        return []
+
+                    tenth_prev_close = df_sorted.iloc[pivot_pos - 10]['close']
+                    current_close = pivot_level
+
                     try:
                         movement_percentage = ((current_close - tenth_prev_close) / tenth_prev_close) * 100
                     except Exception as e:
@@ -1210,7 +1289,7 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
                                 return []
                             
                         # Apply movement and volume filters
-                        if  recent_volume > 1000000:                                   
+                        if  recent_volume > 1500000:                                   
                             
                             # Determine entry price
                             entry_price = current_price
@@ -1233,7 +1312,7 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
                                     elif "error" in order_response:
                                         logger.error(f"Not able to place order for {stockname}: {order_response['error']}")                                                                            
                                     else:                                
-                                        # Create entry signal
+                                    # Create entry signal
                                         entry = {
                                             'entry_time': datetime.now(),
                                             'entry_price': entry_price,
@@ -1620,7 +1699,7 @@ def main():
                 # logger.info(f"Processing {len(token_batches)} batches of tokens...")
                 
                 # Launch all batch processing in parallel
-                futures = [process_token_batch.remote(batch, signal_tracker, order_manager) for batch in token_batches]
+                futures = [process_token_batch.remote(batch, signal_tracker, order_manager, active_trades) for batch in token_batches]
                 
                 # Process results as they arrive
                 all_signals = []
@@ -1691,7 +1770,7 @@ if __name__ == "__main__":
         # Initialize tokens
         token_dict = load_tokens()
 
-        # token_dict = {"BEL25APR300CE": "94856"}
+        # token_dict = {"BSE25MAY7000PE": "35250"}
          # If no tokens were loaded, try to generate them
         if not token_dict:
             logger.info("No tokens loaded....")
