@@ -168,8 +168,8 @@ def get_fourth_week_thursday(b_df):
     month_names = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
                    "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
    
-
-    expiry = "2025-05-29"  # YYYY-MM-DD
+    import nse_fno_expiry_calculator as n # type: ignore
+    expiry = str(n.getNearestMonthlyExpiryDate()) # "2025-05-29"  # YYYY-MM-DD
     t_exp = expiry.split("-")
     month_name = month_names[int(t_exp[1]) - 1]
     format2 = f"{str(t_exp[0])[2:4]}{month_name}"  # YYMM (25MAR)
@@ -248,8 +248,8 @@ def main():
     sorted_tokens = dict(sorted(token_dict.items(), key=lambda item: int(item[1]) if item[1] else 0))
     
     # Take only the tokens after the first 200
-    limited_tokens = dict(list(sorted_tokens.items())[:200])
-    # limited_tokens = dict(list(sorted_tokens.items()))
+    # limited_tokens = dict(list(sorted_tokens.items())[:200])
+    limited_tokens = dict(list(sorted_tokens.items()))
 
     # Create tokens directory if it doesn't exist
     tokens_dir = os.path.join(os.getcwd(), "tokens")
