@@ -50,11 +50,24 @@ RESAMPLED_PREFIX = get_date_prefix() + "resampled"
 
 ############ FLATTRADE EXECUTION START ################
 
-APIKEY='9d87fcbbb8eb47b6b6d577acf3882266'
-secretKey = '2025.09e4f220bec24ced931170e7ee7ba611c8517eb1705b65ac'
-totp_key='F4A3KMU5W4L6P6IQ2LV6J467S4VQTA7Q'
-password = 'Godmode@6'
-userid = 'FZ11934'
+# APIKEY = '9d87fcbbb8eb47b6b6d577acf3882266' #Naveen
+# APIKEY = '5b6a1c26fa6c477eb7a952e85f437080' #Raga
+APIKEY = 'a3f9e4125db14f55b63adc48203a28c2' #Sneha
+
+# secretKey = '2025.09e4f220bec24ced931170e7ee7ba611c8517eb1705b65ac' #Naveen
+# secretKey = '2025.4d2983767a4349308837c84a64c76cb2e5b7537b45497933' #Raga
+secretKey = '2025.2ff09a964f4a4ca18dc8eca42ca9858fa3b7d13dbea3850c' #Sneha
+
+# totp_key = 'F4A3KMU5W4L6P6IQ2LV6J467S4VQTA7Q' #Naveen
+# totp_key = '2RGIA2N5WQXPF7G3H2P6UAB44F6742E6' #Raga
+totp_key = 'CQ5W4324346R6QJ6F3N75C6N64Z5752R' #Sneha
+
+# password = 'Godmode@6' #Nav
+password = 'Hellokitty@1' #raga and sneha same pass
+
+# userid = 'FZ11934' #Nav
+# userid = 'FZ16084' #Raga
+userid = 'FZ16825' #Sneha
 headerJson =  {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.74 Safari/537.36", "Referer":"https://auth.flattrade.in/"}
 
 
@@ -112,7 +125,7 @@ class OrderManager:
         self.budget = 5000
         # Leverage factor for MIS orders
         self.leverage_factor = 4.543
-        self.max_risk = 100
+        self.max_risk = 50
 
     def get_position_book(self):
         """
@@ -740,6 +753,12 @@ class SignalTracker:
 
     def update_symbol_state(self, symbol, state):
         self.symbol_states[symbol] = state
+    
+    def update_remaining_quantity(self, symbol, new_quantity): 
+        if symbol in self.active_trades:
+            self.active_trades[symbol]['remaining_quantity'] = new_quantity
+            return True
+        return False
 
     def reset_symbol_state(self, symbol):
         if symbol in self.symbol_states:            
@@ -769,7 +788,7 @@ def is_market_open():
 
     # Check market hours
     current_time = now.time()
-    market_start = datetime.strptime('09:00', '%H:%M').time()
+    market_start = datetime.strptime('08:30', '%H:%M').time()
     market_end = datetime.strptime('15:30', '%H:%M').time()
 
     return market_start <= current_time <= market_end
@@ -1324,6 +1343,7 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
                                             'movement_percentage': movement_percentage,
                                             'sl_adjusted': False,
                                             'quantity' : order_response['quantity'],
+                                            'remaining_quantity': order_response['quantity'], 
                                             'symbol': stockname
                                         }
                                         
@@ -1450,23 +1470,33 @@ def check_for_exits(active_trades, raw_conn, resampled_conn, signal_tracker, ord
         # Calculate current profit percentage
         profit_percentage = ((current_price - trade['entry_price']) / trade['entry_price']) * 100
 
-        # Check if profit is 5% or more AND we haven't adjusted the stop loss yet
-        if profit_percentage >= 5.0 and not trade.get('sl_adjusted', False):
-            # Calculate new stop loss at 3% below current price
-            new_stop_loss = current_price * 0.97
+        # Replace the existing stop loss adjustment block:
+        if profit_percentage >= 10.0 and not trade.get('sl_adjusted', False):
+            # new_stop_loss = current_price * 0.97
             
-            # Only update if the new stop loss is higher than the existing one
-            if new_stop_loss > trade['stop_loss']:
-                # Update the stop loss and mark as adjusted
-                ray.get(signal_tracker.update_trade_with_sl_adjusted_flag.remote(symbol, new_stop_loss))
+            # if new_stop_loss > trade['stop_loss']:
+            half_quantity = trade['remaining_quantity'] // 2
+            
+            try:
+                # Sell half position
+                ray.get(order_manager.place_order.remote(symbol, 'sell', half_quantity))
                 
-                # Update local copy for this iteration
-                trade['stop_loss'] = new_stop_loss
+                # Update trade
+                ray.get(signal_tracker.update_trade_with_sl_adjusted_flag.remote(symbol, trade['stop_loss']))
+                ray.get(signal_tracker.update_remaining_quantity.remote(symbol, trade['remaining_quantity'] - half_quantity))
+                
+                # Update local copy
+                trade['stop_loss'] = trade['entry_price']
                 trade['sl_adjusted'] = True
+                trade['remaining_quantity'] = trade['remaining_quantity'] - half_quantity
                 
-                # Print stop loss adjustment notification
-                print(f"\nAdjusted stop loss for {symbol}: New SL: {new_stop_loss:.2f} (original: {trade['entry_price'] * 0.99:.2f})")
+                print(f"\nSold half position for {symbol}: {half_quantity} shares at {current_price:.2f} ({profit_percentage:.2f}% profit)")
+                # print(f"New stop loss: {new_stop_loss:.2f} for remaining {trade['remaining_quantity']} shares")
                 
+            except:
+                logger.error(f"Failed to sell half position for {symbol}")
+
+
         # Get latest EMA10 from resampled data if available
         previous_candle_ema10 = None
         live_ema10 = None
@@ -1531,13 +1561,12 @@ def check_for_exits(active_trades, raw_conn, resampled_conn, signal_tracker, ord
                 
         if exit_data:
             try:
-                # Get the quantity to sell from the active trade
-                quantity_to_sell = trade.get('quantity', None)
-                if quantity_to_sell is None:
+                quantity_to_sell = trade.get('remaining_quantity', trade.get('quantity', None))
+                if quantity_to_sell is None or quantity_to_sell <= 0:
                     logger.error(f"Exit order for {symbol} failed: No quantity available in trade record")
                 else:
                     # Place the sell order with the same quantity as purchased
-                    exit_order = ray.get(order_manager.place_order.remote(symbol, 'sell', quantity_to_sell))                                  
+                    ray.get(order_manager.place_order.remote(symbol, 'sell', quantity_to_sell))                                  
             except:
                 logger.error("Not able to place order in --check for exits-- for ", symbol)
             
@@ -1770,7 +1799,7 @@ if __name__ == "__main__":
         # Initialize tokens
         token_dict = load_tokens()
 
-        # token_dict = {"BSE25MAY7000PE": "35250"}
+        # token_dict = {"HDFCAMC25JUN5000CE": "93694"}
          # If no tokens were loaded, try to generate them
         if not token_dict:
             logger.info("No tokens loaded....")
