@@ -1187,8 +1187,8 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
     
     entries = []
     current_time = datetime.now().time()
-    start_time = datetime.strptime('09:15', '%H:%M').time()
-    exit_time = datetime.strptime('15:20', '%H:%M').time()
+    start_time = datetime.strptime('09:20', '%H:%M').time()
+    exit_time = datetime.strptime('15:15', '%H:%M').time()
     
     # Skip if current time is before start time
     if current_time < start_time:
@@ -1278,6 +1278,10 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
                     pivot_candles = df_sorted[df_sorted['pivot'] == 2]
                     if len(pivot_candles) == 0:
                         return []
+                    
+                    current_index = len(df_sorted) - 1
+                    if current_index - pivot_index > 12:
+                        return []
 
                     pivot_idx = pivot_candles.index[-1]
                     pivot_pos = df_sorted.index.get_loc(pivot_idx)
@@ -1294,7 +1298,7 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
                         # print("Movement percent 0 division error for ", stockname)
                         return []
 
-                    if movement_percentage > 20:
+                    if movement_percentage > 50:
                         if  'adjVol' in df.columns and 'close' in df.columns:
 
                             # Check volume condition 
@@ -1316,7 +1320,7 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
                             # Check for valid entry - percentage difference from pivot should be <= 20%
                             percentage_diff = ((entry_price - pivot_level) / pivot_level) * 100
 
-                            if percentage_diff <= 20:
+                            if percentage_diff <= 10:
                                 
                                 # Calculate stop loss
                                 stop_loss_price = entry_price * 0.99
@@ -1449,7 +1453,7 @@ def check_for_exits(active_trades, raw_conn, resampled_conn, signal_tracker, ord
     
     trades_to_exit = []
     current_time = datetime.now().time()
-    exit_time = datetime.strptime('15:20', '%H:%M').time()
+    exit_time = datetime.strptime('15:15', '%H:%M').time()
     
     # Process each active trade individually
     for symbol, trade in active_trades.items():
