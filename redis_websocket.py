@@ -313,10 +313,10 @@ def connectFeed(sws,tokeList =None):
     def on_open(wsapp):
         logger.info("on open")
         token_list = [
-            {
-                "exchangeType": 1,
-                "tokens": ["26009"]
-            }
+            # {
+            #     "exchangeType": 1,
+            #     "tokens": ["26009"]
+            # }
         ]
         if tokeList: token_list.append(tokeList)
         sws.subscribe(config.CORRELATION_ID, config.FEED_MODE, token_list)
@@ -363,6 +363,7 @@ def initialize_tokens():
     # Try to run tokengen and load tokens
     if run_tokengen():
         fno_token = load_tokens()
+        return fno_token
 
     # If token dictionary is empty, use a small default dictionary for testing
     if not fno_token:
@@ -377,7 +378,7 @@ if __name__ == "__main__":
         # #Check if token file already exists
         if not check_token_file_exists():
             print("Token file for today doesn't exist. Generating new tokens...")
-            initialize_tokens()
+            fno_token = initialize_tokens()
         else:
             print("Token file for today already exists. Loading tokens...")
             # global fno_token
