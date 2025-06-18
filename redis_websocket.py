@@ -309,15 +309,11 @@ def subscribeSymbol(token_list,sws):
     logger.info(f'Subscribe -------  {token_list}')
     sws.subscribe(config.CORRELATION_ID, config.FEED_MODE, token_list)
 
-def connectFeed(sws,tokeList =None):
+def connectFeed(sws,fno_token, tokeList =None):
     def on_open(wsapp):
         logger.info("on open")
-        token_list = [
-            # {
-            #     "exchangeType": 1,
-            #     "tokens": ["26009"]
-            # }
-        ]
+        subscribeList = [{"exchangeType": 2, "tokens": list(fno_token.values())}]
+        token_list =subscribeList
         if tokeList: token_list.append(tokeList)
         sws.subscribe(config.CORRELATION_ID, config.FEED_MODE, token_list)
 
@@ -397,13 +393,13 @@ if __name__ == "__main__":
 
         config.SMART_API_OBJ, config.SMART_WEB = login()
 
-        connectFeed(config.SMART_WEB)
+        connectFeed(config.SMART_WEB, fno_token)
         time.sleep(5)
         logger.info("-----------Subscribe--------")
         # subscribeList  = [{"exchangeType": 2, "tokens":list(fno_token.values())[:100]}]
         subscribeList = [{"exchangeType": 2, "tokens": list(fno_token.values())}]
         # subscribeList  = [{"exchangeType": 5, "tokens":mcx_token}]
-        subscribeSymbol(subscribeList, config.SMART_WEB)
+        # subscribeSymbol(subscribeList, config.SMART_WEB)
         i = 1
         while True:
             time.sleep(0.1)
