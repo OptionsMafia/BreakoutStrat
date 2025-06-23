@@ -1486,7 +1486,7 @@ def check_for_exits(active_trades, raw_conn, resampled_conn, signal_tracker, ord
                 ray.get(order_manager.place_order.remote(symbol, 'sell', half_quantity))
                 
                 # Update trade
-                ray.get(signal_tracker.update_trade_with_sl_adjusted_flag.remote(symbol, trade['stop_loss']))
+                ray.get(signal_tracker.update_trade_with_sl_adjusted_flag.remote(symbol, trade['entry_price']))
                 ray.get(signal_tracker.update_remaining_quantity.remote(symbol, trade['remaining_quantity'] - half_quantity))
                 
                 # Update local copy
