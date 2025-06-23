@@ -1,6 +1,5 @@
 '''
-trading_system.py - Changed the risk to 20Rs
-
+trading_system.py
 '''
 import redis
 import time
@@ -19,6 +18,8 @@ import requests
 from urllib.parse import parse_qs,urlparse
 import traceback
 import hashlib
+from SmartApi import SmartConnect
+import pyotp, config
 
 # CHANGE MARKET TIME IN IS_MARKET_OPEN() AND EXIT TIME IN STRATEGY()
 # Configure logging
@@ -125,7 +126,24 @@ class OrderManager:
         self.budget = 5000
         # Leverage factor for MIS orders
         self.leverage_factor = 4.543
-        self.max_risk = 50
+        self.max_risk = 20
+        self.angel_api = self.connect_to_angel()
+
+    def connect_to_angel(self):
+        """Connect to Angel One API"""
+        try:
+            obj=SmartConnect(api_key=config.API_KEY)
+            data = obj.generateSession(config.USERNAME,config.PIN,pyotp.TOTP(config.TOKEN).now())
+            #print(data)
+            AUTH_TOKEN = data['data']['jwtToken']
+            refreshToken= data['data']['refreshToken']
+            FEED_TOKEN=obj.getfeedToken()
+            res = obj.getProfile(refreshToken)            
+            return obj
+        
+        except Exception as e:
+            logger.error(f"Error connecting to Angel One API: {str(e)}")
+            return None
 
     def get_position_book(self):
         """
@@ -175,20 +193,85 @@ class OrderManager:
         
         return quantity
     
+    def get_current_candle_data(self, symbol, price):
+        """
+        Get the current forming candle's low value using Angel One API
+        
+        Args:
+            symbol (str): The option symbol 
+            price (float): Current price to use as fallback
+            
+        Returns:
+            float: Current candle's low value or fallback price * 0.99
+        """
+        try:
+            if not self.angel_api:
+                return price * 0.99
+            
+            # Get the token value for this symbol
+            exchange = "NFO"  # For options
+            
+            # Calculate dates - Angel One API expects dates in format "YYYY-MM-DD HH:MM"
+            now = datetime.now()
+            
+            # For 5-minute candle, get data from the past 10 minutes
+            from_date = (now - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+            to_date = now.strftime("%Y-%m-%d %H:%M")
+            
+            # try:
+            # Request candle data
+            data = self.angel_api.getCandleData({
+                "exchange": exchange,
+                "symboltoken": token_dict.get(symbol, ""),
+                "interval": "FIVE_MINUTE",
+                "fromdate": from_date,
+                "todate": to_date
+            })
+            if not (data and data.get('data')):
+             return price * 0.99
+            
+            # Check if we're in first minute of 5-min interval
+            current_5min_start = (now.minute // 5) * 5
+            in_first_minute = now.minute == current_5min_start
+            
+            candles = data['data']
+            if len(candles) < 2:
+                return price * 0.99
+                
+            # Get the appropriate candle low
+            if in_first_minute:
+                # Use previous candle (second last)
+                target_low = float(candles[-2][3])
+            else:
+                # Use current forming candle (last)
+                target_low = float(candles[-1][3])
+            
+            if target_low > price:
+                return price * 0.99
+                
+            return target_low if target_low != price else price * 0.99
+            
+                
+        except Exception as e:
+            logger.error(f"Error in get_current_candle_data for {symbol}: {str(e)}")
+            return price * 0.99
+    
     def place_order(self, stockname, b_s, quantity=None):        
         """Place an order using the persistent API connection"""
         temp = stockname
         val = temp.split("25")[0]
         stock_name = val+"-EQ"
+        call_option = temp.endswith("CE")
+        put_option = temp.endswith("PE")
         if b_s == 'buy':
-            if "CE" in temp and "PE" not in temp:
+            if call_option:
                 order_type = "B"
-            else:
+            elif put_option:
                 order_type = "S"
         elif b_s == 'sell':
-            if "CE" in temp and "PE" not in temp:
+            if call_option:
                 order_type = "S"
-            else:
+            elif put_option:
                 order_type = "B"
 
         try:
@@ -1151,6 +1234,184 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
         list: List of entry signals
     """
     # Get state for this symbol
+    # state = get_symbol_state(stockname)
+
+    # if (stockname in active_trades or 
+    #     state['in_trade'] or 
+    #     len(df) < 15 or 
+    #     current_price < 2):
+    #     return []
+    
+    # # import pandas as pd
+    # # pd.set_option('display.max_rows', None)
+    # # pd.set_option('display.max_columns', None)
+    # # pd.set_option('display.width', None)
+    # # pd.set_option('display.max_colwidth', None)
+    
+    # # # Print the complete dataframe
+    # # print("\nComplete DataFrame:")
+    # # print(stockname)
+    # # print(df)
+    # # print(pivot_info)
+    # # ray.get(order_manager.get_current_candle_data.remote(stockname, 11))
+    # # time.sleep(1000)
+
+    # current_time = datetime.now().time()
+    # if not (datetime.strptime('09:20', '%H:%M').time() <= current_time < datetime.strptime('15:15', '%H:%M').time()):
+    #     return []
+
+    
+    # # Check if we need to sort the dataframe by timestamp
+    # if 'timestamp' in df.columns and not df['timestamp'].is_monotonic_increasing:
+    #     try:
+    #         df = df.sort_values('timestamp')
+    #     except Exception:
+    #         pass
+ 
+    # # Extract pivot level from pivot_info and validate against the dataframe
+    # if pivot_info and 'pivot_index' in pivot_info:
+    #     pivot_index = pivot_info['pivot_index']
+
+    #     # Check if there are pivot candles in the dataframe
+    #     pivot_candles = df[df['pivot'] == 2]
+    
+    # if len(pivot_candles) == 0:
+    #     return []
+    
+    
+    # # First try to find it based on index if we can
+    # if 'pivot_candle_index' in df.columns:
+    #     matching_pivots = df[df['pivot_candle_index'] == str(pivot_index)]
+    #     if not matching_pivots.empty:
+    #         pivot_candle = matching_pivots.iloc[0]
+    #     else:
+    #         # If we can't find by index, use the most recent pivot
+    #         # pivot_candle = pivot_candles.iloc[-1]
+    #         logger.info("\nERROR: PIVOT MISMATCH OR SOME SH*T IN: ", stockname)
+    #         return []
+    # else:
+    #     # Use the most recent pivot
+    #     # pivot_candle = pivot_candles.iloc[-1]
+    #     logger.info("\nERROR: PIVOT MISMATCH OR SOME SH*T IN: ", stockname)
+    #     return []  
+
+    # pivot_level = pivot_candle['high']
+
+    # used_pivot = ray.get(signal_tracker.get_used_pivot.remote(stockname))            
+    
+    # # Check if we've already used this pivot
+    # if used_pivot != 0 and abs(used_pivot - pivot_level) < 0.01:
+    #     # Skip this trade as we've already used this pivot
+    #     return []
+
+    # # Calculate ADR value
+    # adr_value, ot, nt = calculate_adr(df)              
+    
+    # # Skip if ADR value couldn't be calculated or is greater than 70%
+    # if adr_value is None or adr_value <= 5:
+    #     return []     
+
+    # # Update state with pivot information
+    # state['pivot_level'] = pivot_level
+    # state['pivot_candle_index'] = pivot_index
+
+    # live_ema10, _ = get_live_ema_values(df, current_price)
+
+    # # Check if live_ema10 is available
+    # if live_ema10 is None and len(df) > 0:
+    #     # Fall back to the latest EMA10 from the dataframe
+    #     latest_row = df.iloc[-1]
+    #     if 'ema10' in latest_row:
+    #         live_ema10 = latest_row['ema10']
+    
+    # # Skip if we don't have a valid EMA10 value
+    # if live_ema10 is None:
+    #     return []
+
+    # # Check if current price has broken above the pivot level
+    # if not current_price > pivot_level and check_ema_conditions(df, current_price) and current_price > live_ema10:                               
+    #     return []
+    
+    # current_index = len(df) - 1
+    # if current_index - pivot_index > 12:
+    #     return []
+    
+    # pivot_idx = pivot_candles.index[-1]
+    # pivot_pos = df.index.get_loc(pivot_idx)
+
+    # if pivot_pos < 10:
+    #     return []
+    
+    # try:
+    #     tenth_prev_close = df.iloc[pivot_pos - 10]['close']
+    #     movement_percentage = ((pivot_level - tenth_prev_close) / tenth_prev_close) * 100
+    # except Exception:
+    #     return []
+    
+    # if movement_percentage <= 50:
+    #     return []
+    
+    # # Volume validation
+    # if 'adjVol' not in df.columns or 'close' not in df.columns:
+    #     return []
+    
+    # try:
+    #     last_5_candles = df.iloc[-6:]
+    #     recent_volume = (last_5_candles['close'] * last_5_candles['adjVol']).sum()
+    # except Exception:
+    #     return []
+    
+    # if recent_volume <= 1500000:
+    #     return []
+    
+    # # Entry validation
+    # entry_price = current_price
+    # percentage_diff = ((entry_price - pivot_level) / pivot_level) * 100
+    
+    # if percentage_diff > 10:
+    #     return []
+    
+    # # Execute trade
+    # try:
+    #     stop_loss_price = ray.get(order_manager.get_current_candle_data.remote(stockname, entry_price))
+    #     order_response = ray.get(order_manager.place_order.remote(stockname, 'buy'))
+
+    #     if order_response is None:
+    #         logger.error(f"Order response is None for {stockname}")
+    #         return []
+        
+    #     if "error" in order_response:
+    #         logger.error(f"Order error for {stockname}: {order_response['error']}")
+    #         return []
+
+    #     # Create entry signal
+    #     entry = {
+    #         'entry_time': datetime.now(),
+    #         'entry_price': entry_price,
+    #         'stop_loss': stop_loss_price,
+    #         'pivot_level': pivot_level,
+    #         'ema10': df.iloc[-1]['ema10'] if 'ema10' in df.columns else None,
+    #         'entry_type': 'Breakout',
+    #         'entry_reason': f'Breakout above pivot {pivot_level:.2f} with {movement_percentage:.2f}% movement',
+    #         'movement_percentage': movement_percentage,
+    #         'sl_adjusted': False,
+    #         'quantity' : order_response['quantity'],
+    #         'remaining_quantity': order_response['quantity'], 
+    #         'symbol': stockname
+    #     }     
+
+    #     # Update state
+    #     state['in_trade'] = True
+    #     state['stop_loss_price'] = stop_loss_price
+    #     ray.get(signal_tracker.set_used_pivot.remote(stockname, pivot_level))   
+                
+    #     return [entry]
+
+    # except:
+    #     logger.error("Not able to place order in strategy for ", stockname)   
+
+    # return []                              
+
     state = get_symbol_state(stockname)
 
     if stockname in active_trades:
@@ -1323,9 +1584,10 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
                             if percentage_diff <= 10:
                                 
                                 # Calculate stop loss
-                                stop_loss_price = entry_price * 0.99
+                                # stop_loss_price = entry_price * 0.99
                                 
                                 try:
+                                    stop_loss_price = ray.get(order_manager.get_current_candle_data.remote(stockname, entry_price))
                                     order_response = ray.get(order_manager.place_order.remote(stockname, 'buy'))  
                                     # Add a check for None before trying to iterate
                                     if order_response is None:
@@ -1365,6 +1627,7 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
                                     logger.error("Not able to place order in strategy for ", stockname)                                 
 
     return entries
+    
 
 def print_signal(signal):
     """Print a signal in a readable format"""
@@ -1803,7 +2066,7 @@ if __name__ == "__main__":
         # Initialize tokens
         token_dict = load_tokens()
 
-        # token_dict = {"HDFCAMC25JUN5000CE": "93694"}
+        # token_dict = {"BHEL25JUN250PE": "75480"}
          # If no tokens were loaded, try to generate them
         if not token_dict:
             logger.info("No tokens loaded....")
