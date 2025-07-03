@@ -1,7 +1,7 @@
 '''
 trading_system.py 
-
 '''
+
 import redis
 import time
 import pandas as pd
@@ -25,8 +25,16 @@ import numpy as np
 from scipy.stats import norm
 from scipy.optimize import brentq
 import math
+import re
 
-# CHANGE MARKET TIME IN IS_MARKET_OPEN() AND EXIT TIME IN STRATEGY()
+# Calculate the T value for position calculation
+import nse_fno_expiry_calculator as n # type: ignore
+expiry_str = str(n.getNearestMonthlyExpiryDate())
+expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+today = datetime.now().date()
+days_to_expiry = (expiry_date - today).days
+TIME_TO_EXPIRY = max(round(days_to_expiry / 365.0, 3), 0.002)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -234,20 +242,21 @@ class OrderManager:
                 }, None
             
 
-            S, K, T, r = equityprice, strike, 0.002, 0.01
+            S, K, r = equityprice, strike, 0.01
+            T = TIME_TO_EXPIRY
             market_price, stop_loss, risk_amount = optionprice, optionsl, self.max_risk
 
             result, _ = calculate_position(S, K, T, r, market_price, stop_loss, risk_amount, is_call)
 
-            budget_based_quantity = int(self.budget / equityprice)
+            # budget_based_quantity = int(self.budget / equityprice)
         
             # Use the smaller of the two quantities
             if result:
-                quantity = min(result['position_size'], budget_based_quantity)
-            else:
-                quantity = budget_based_quantity
+                quantity = result['position_size']
+            # else:
+            #     quantity = budget_based_quantity
 
-            if quantity < 1:
+            if quantity is None:
                 return 0
 
             return max(1, quantity)
@@ -339,22 +348,26 @@ class OrderManager:
             if call_option:
                 order_type = "B"
                 is_call = True
-                strike_str = stockname.split("CE")[0]
+                # strike_str = stockname.split("CE")[0]
             elif put_option:
                 order_type = "S"
                 is_call = False
-                strike_str = stockname.split("PE")[0]
+                # strike_str = stockname.split("PE")[0]
         elif b_s == 'sell':
             if call_option:
                 order_type = "S"
                 is_call = True
-                strike_str = stockname.split("CE")[0]
+                # strike_str = stockname.split("CE")[0]
             elif put_option:
                 order_type = "B"
                 is_call = False
-                strike_str = stockname.split("PE")[0]
+                # strike_str = stockname.split("PE")[0]
 
-        strike = float(''.join(filter(str.isdigit, strike_str[-4:])))
+        strike_match = re.search(r'(\d+)(?:CE|PE)$', stockname)
+
+        if not strike_match:
+            return {"error": f"No strike found in {stockname}"}
+        strike = float(strike_match.group(1))  
 
         try:
             quote = self.api.get_quotes("NSE", stock_name)
@@ -1314,18 +1327,13 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
         
     Returns:
         list: List of entry signals
-    """
-                             
+    """          
 
     state = get_symbol_state(stockname)
 
     if stockname in active_trades:
         return []  # Skip if already in trade
-    
-    # Using the flattrade position book to see the existing position
-    # if check_existing_position(stockname, order_manager):
-    #     return []  # Skip if position already exists
-    
+
     # Skip if already in a trade
     if state['in_trade']:
         return []    
@@ -1423,7 +1431,7 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
             live_ema10, _ = get_live_ema_values(df, current_price)
 
             # Check if live_ema10 is available
-            if live_ema10 is None: #and len(df) > 0:
+            if live_ema10 is None and len(df) > 0:
                 # Fall back to the latest EMA10 from the dataframe
                 latest_row = df.iloc[-1]
                 if 'ema10' in latest_row:
@@ -1434,102 +1442,103 @@ def strategy(df, stockname, pivot_info, current_price, signal_tracker, order_man
                 return []
 
             # Check if current price has broken above the pivot level
-            if current_price > pivot_level and check_ema_conditions(df, current_price) and current_price > live_ema10:                               
+            if current_price > pivot_level and check_ema_conditions(df, current_price): # and current_price > live_ema10:                               
                 
                 # Calculate movement percentage (10-candle lookback from the pivot)
-                # if len(df) >= 12:
-                # Sort to ensure we're using the right order
-                df_sorted = df.sort_values('timestamp')
-                
-                pivot_candles = df_sorted[df_sorted['pivot'] == 2]
-                if len(pivot_candles) == 0:
-                    return []
-                
-                current_index = len(df_sorted) - 1
-                if current_index - pivot_index > 12:
-                    return []
+                if len(df) >= 12:
+                    # Sort to ensure we're using the right order
+                    df_sorted = df.sort_values('timestamp')
+                    
+                    pivot_candles = df_sorted[df_sorted['pivot'] == 2]
+                    if len(pivot_candles) == 0:
+                        return []
+                    
+                    current_index = len(df_sorted) - 1
+                    if current_index - pivot_index > 12:
+                        return []
 
-                pivot_idx = pivot_candles.index[-1]
-                pivot_pos = df_sorted.index.get_loc(pivot_idx)
+                    pivot_idx = pivot_candles.index[-1]
+                    pivot_pos = df_sorted.index.get_loc(pivot_idx)
 
-                if pivot_pos < 10:
-                    return []
+                    if pivot_pos < 10:
+                        return []
 
-                tenth_prev_close = df_sorted.iloc[pivot_pos - 10]['close']
-                current_close = pivot_level
+                    tenth_prev_close = df_sorted.iloc[pivot_pos - 10]['close']
+                    current_close = pivot_level
 
-                try:
-                    movement_percentage = ((current_close - tenth_prev_close) / tenth_prev_close) * 100
-                except Exception as e:
-                    # print("Movement percent 0 division error for ", stockname)
-                    return []
+                    try:
+                        movement_percentage = ((current_close - tenth_prev_close) / tenth_prev_close) * 100
+                    except Exception as e:
+                        # print("Movement percent 0 division error for ", stockname)
+                        return []
 
-                if movement_percentage > 50:
-                    if  'adjVol' in df.columns and 'close' in df.columns:
+                    if movement_percentage > 50:
+                        if  'adjVol' in df.columns and 'close' in df.columns:
 
-                        # Check volume condition 
-                        recent_volume = 0
-                        # Calculate price_volume for the last 5 candles
-                        last_5_candles = df_sorted.iloc[-6:]
-                        try:
-                            recent_volume = (last_5_candles['close'] * last_5_candles['adjVol']).sum()                     
-                        except:
-                            # print("volume: 0 division error for ", stockname)
-                            return []
-                        
-                    # Apply movement and volume filters
-                    if  recent_volume > 1500000:                                   
-                        
-                        # Determine entry price
-                        entry_price = current_price
-                        
-                        # Check for valid entry - percentage difference from pivot should be <= 20%
-                        percentage_diff = ((entry_price - pivot_level) / pivot_level) * 100
-
-                        if percentage_diff <= 10:
-                            
-                            # Calculate stop loss
-                            # stop_loss_price = entry_price * 0.99
-                            
+                            # Check volume condition 
+                            recent_volume = 0
+                            # Calculate price_volume for the last 5 candles
+                            last_5_candles = df_sorted.iloc[-6:]
                             try:
-                                stop_loss_price = ray.get(order_manager.get_current_candle_data.remote(stockname, entry_price))
-                                order_response = ray.get(order_manager.place_order.remote(stockname, 'buy', entryprice=entry_price, stoploss=stop_loss_price))  
-                                # Add a check for None before trying to iterate
-                                if order_response is None:
-                                    logger.error(f"Order response is None for {stockname}")   
-                                    return []                                 
-                                # Skip this trade                                                                      
-                                elif "error" in order_response:
-                                    logger.error(f"Not able to place order for {stockname}: {order_response['error']}")                                                                            
-                                else:                                
-                                # Create entry signal
-                                    entry = {
-                                        'entry_time': datetime.now(),
-                                        'entry_price': entry_price,
-                                        'stop_loss': stop_loss_price,
-                                        'pivot_level': pivot_level,
-                                        'ema10': df_sorted.iloc[-1]['ema10'] if 'ema10' in df_sorted.columns else None,
-                                        'entry_type': 'Breakout',
-                                        'entry_reason': f'Breakout above pivot {pivot_level:.2f} with {movement_percentage:.2f}% movement',
-                                        'movement_percentage': movement_percentage,
-                                        'sl_adjusted': False,
-                                        'quantity' : order_response['quantity'],
-                                        'remaining_quantity': order_response['quantity'], 
-                                        'symbol': stockname
-                                    }
-                                    
-                                    entries.append(entry)
-                            
-                                    # Update state
-                                    state['in_trade'] = True
-                                    state['stop_loss_price'] = stop_loss_price
-                                    ray.get(signal_tracker.set_used_pivot.remote(stockname, pivot_level)) 
-                                    # print("ADR: ", adr_value, "15th candle: ", 
-                                    #         "15th candle: ",ot,
-                                    #         "1st candle: ",nt)  
-
+                                recent_volume = (last_5_candles['close'] * last_5_candles['adjVol']).sum()                     
                             except:
-                                logger.error("Not able to place order in strategy for ", stockname)                                 
+                                # print("volume: 0 division error for ", stockname)
+                                return []
+                            
+                        # Apply movement and volume filters
+                        if  recent_volume > 1000000:                                   
+                            
+                            # Determine entry price
+                            entry_price = current_price
+                            
+                            # Check for valid entry - percentage difference from pivot should be <= 20%
+                            percentage_diff = ((entry_price - pivot_level) / pivot_level) * 100
+
+                            if percentage_diff <= 10:
+                                
+                                # Calculate stop loss
+                                # stop_loss_price = entry_price * 0.99
+                                
+                                try:
+                                    stop_loss_price = ray.get(order_manager.get_current_candle_data.remote(stockname, entry_price))
+                                    order_response = ray.get(order_manager.place_order.remote(stockname, 'buy'))  
+                                    
+                                    # Add a check for None before trying to iterate
+                                    if order_response is None:
+                                        logger.error(f"Order response is None for {stockname}")   
+                                        return []                                 
+                                    # Skip this trade                                                                      
+                                    elif "error" in order_response:
+                                        logger.error(f"Not able to place order for {stockname}: {order_response['error']}")                                                                            
+                                    else:                                
+                                    # Create entry signal
+                                        entry = {
+                                            'entry_time': datetime.now(),
+                                            'entry_price': entry_price,
+                                            'stop_loss': stop_loss_price,
+                                            'pivot_level': pivot_level,
+                                            'ema10': df_sorted.iloc[-1]['ema10'] if 'ema10' in df_sorted.columns else None,
+                                            'entry_type': 'Breakout',
+                                            'entry_reason': f'Breakout above pivot {pivot_level:.2f} with {movement_percentage:.2f}% movement',
+                                            'movement_percentage': movement_percentage,
+                                            'sl_adjusted': False,
+                                            'quantity' : order_response['quantity'],
+                                            'remaining_quantity': order_response['quantity'], 
+                                            'symbol': stockname
+                                        }
+                                        
+                                        entries.append(entry)
+                                
+                                        # Update state
+                                        state['in_trade'] = True
+                                        state['stop_loss_price'] = stop_loss_price
+                                        ray.get(signal_tracker.set_used_pivot.remote(stockname, pivot_level)) 
+                                        # print("ADR: ", adr_value, "15th candle: ", 
+                                        #         "15th candle: ",ot,
+                                        #         "1st candle: ",nt)  
+
+                                except:
+                                    logger.error("Not able to place order in strategy for ", stockname)                                 
 
     return entries
     
@@ -1896,7 +1905,7 @@ def main():
                         logger.info(f"Exited {exits} positions")
                 
                 # Process token batches with parallel execution
-                process_start = time.time()
+                # process_start = time.time()
                 # logger.info(f"Processing {len(token_batches)} batches of tokens...")
                 
                 # Launch all batch processing in parallel
@@ -1971,7 +1980,7 @@ if __name__ == "__main__":
         # Initialize tokens
         token_dict = load_tokens()
 
-        # token_dict = {"BHEL25JUN250PE": "75480"}
+        # token_dict = {"SHRIRAMFIN25JUN700CE": "137365"}
          # If no tokens were loaded, try to generate them
         if not token_dict:
             logger.info("No tokens loaded....")
